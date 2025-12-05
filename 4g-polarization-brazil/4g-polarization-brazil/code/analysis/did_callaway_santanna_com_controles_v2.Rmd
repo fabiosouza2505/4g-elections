@@ -1,0 +1,345 @@
+---
+title: "did_cs_controle3G"
+author: "Fabio de Medeiros"
+date: "2025-11-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+# ============================================
+# CS COM DADOS 3G CORRETOS (1999-2022)
+# ============================================
+
+```{r packages}
+library(tidyverse)
+library(data.table)
+library(did)
+library(stats)
+```
+
+
+```{r data_load}
+# Carregar painel controle 3G
+dados_cs <- fread("painel_event_study_com_3g_final.csv",
+                  colClasses = c(codigo_tse = "character"))
+```
+
+
+```{r preparing_data}
+# Preparar
+dados_cs <- dados_cs %>%
+  mutate(
+    id = as.numeric(factor(codigo_tse)),
+    tempo = as.integer(ano),
+    # Preencher NAs com 0 para municípios sem 3G
+    tem_3g = replace_na(tem_3g, 0),
+    anos_3g = replace_na(anos_3g, 0)
+  )
+
+# Identificar nunca tratados (4G)
+nunca_tratados_4g <- dados_cs %>%
+  group_by(codigo_tse) %>%
+  summarise(max_4g = max(tem_4g, na.rm = TRUE)) %>%
+  filter(max_4g == 0) %>%
+  pull(codigo_tse)
+
+# Criar gname ANTES de filtrar
+dados_cs <- dados_cs %>%
+  mutate(
+    gname = case_when(
+      codigo_tse %in% nunca_tratados_4g ~ 0L,
+      !is.na(ano_primeira_4g) ~ as.integer(ano_primeira_4g),
+      TRUE ~ 0L
+    )
+  )
+```
+
+
+```{r verificar_cohorts}
+
+# Verificar cohorts
+cohort_dist <- dados_cs %>%
+  filter(tempo == min(tempo)) %>%
+  count(gname) %>%
+  mutate(
+    label = ifelse(gname == 0, "Never treated", paste("Cohort", gname)),
+    pct = n / sum(n) * 100
+  ) %>%
+  arrange(gname)
+
+print(cohort_dist)
+```
+
+```{r verificar_gname}
+# Verificar se gname existe
+cat(sprintf("\n✅ Variável gname criada: %d valores únicos\n", 
+            n_distinct(dados_cs$gname)))
+cat(sprintf("   Range: %d a %d\n", 
+            min(dados_cs$gname), 
+            max(dados_cs$gname)))
+```
+
+# ============================================================================
+# controle tem_3g
+# ============================================================================
+
+```{r estimar_CS}
+# Estimar CS
+cs_controls_correto_tem3g <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ tem_3g,  # Controle 3G CORRETO
+  data = dados_cs,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+cat("\n✅ Modelo estimado com sucesso!\n")
+```
+
+```{r}
+cs_agg_correto_tem3g <- aggte(cs_controls_correto_tem3g, type = "simple")
+
+cat(sprintf("\nATT médio: %.6f\n", cs_agg_correto_tem3g$overall.att))
+cat(sprintf("SE: %.6f\n", cs_agg_correto_tem3g$overall.se))
+
+z_stat <- cs_agg_correto_tem3g$overall.att / cs_agg_correto_tem3g$overall.se
+p_val <- 2 * pnorm(-abs(z_stat))
+
+cat(sprintf("P-valor: %.4f %s\n", p_val,
+            ifelse(p_val < 0.01, "***", 
+                   ifelse(p_val < 0.05, "**", 
+                          ifelse(p_val < 0.1, "*", "")))))
+
+baseline_mean <- mean(dados_cs$esteban_ray[dados_cs$tempo == min(dados_cs$tempo)])
+efeito_pct <- (cs_agg_correto_tem3g$overall.att / baseline_mean) * 100
+
+cat(sprintf("Efeito em %%: %+.2f%% da baseline (%.4f)\n", efeito_pct, baseline_mean))
+```
+
+```{r}
+cs_agg_dynamic_correto_tem3G <- aggte(
+  cs_controls_correto_tem3g, 
+  type = "dynamic",
+  balance_e = NULL
+)
+
+event_correto_df_tem3g <- data.frame(
+  tempo_rel =cs_agg_dynamic_correto_tem3G$egt,
+  att = cs_agg_dynamic_correto_tem3G$att.egt,
+  se = cs_agg_dynamic_correto_tem3G$se.egt
+) %>%
+  mutate(
+    ic_lower = att - 1.96 * se,
+    ic_upper = att + 1.96 * se,
+    pval = 2 * pnorm(-abs(att/se)),
+    sig = case_when(
+      pval < 0.01 ~ "***",
+      pval < 0.05 ~ "**",
+      pval < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+for(i in 1:nrow(event_correto_df_tem3g)) {
+  cat(sprintf("  t=%+3d: ATT=%+.6f, SE=%.6f, p=%.4f %s\n",
+              event_correto_df_tem3g$tempo_rel[i],
+              event_correto_df_tem3g$att[i],
+              event_correto_df_tem3g$se[i],
+              event_correto_df_tem3g$pval[i],
+              event_correto_df_tem3g$sig[i]))
+}
+```
+
+```{r}
+pre_correto_tem3g <- event_correto_df_tem3g %>% filter(tempo_rel < 0)
+n_sig_correto_tem3g <- sum(pre_correto_tem3g$pval < 0.05)
+
+cat(sprintf("\nCoeficientes pré-tratamento: %d\n", nrow(pre_correto_tem3g)))
+cat(sprintf("Significativos a 5%%: %d (%.1f%%)\n",
+            n_sig_correto_tem3g,
+            n_sig_correto_tem3g/nrow(pre_correto_tem3g)*100))
+
+if(n_sig_correto_tem3g == 0) {
+  cat("\n✅ EXCELENTE: Nenhum significativo!\n")
+  cat("   → Parallel trends válido\n")
+} else if(n_sig_correto_tem3g <= nrow(pre_correto_tem3g) * 0.25) {
+  cat("\n✅ BOM: Poucos significativos (<25%)\n")
+  cat("   → Parallel trends plausível\n")
+} else if(n_sig_correto_tem3g <= nrow(pre_correto_tem3g) * 0.5) {
+  cat("\n⚠️  MODERADO: Alguns significativos (25-50%)\n")
+  cat("   → Parallel trends questionável\n")
+} else {
+  cat("\n🚨 PROBLEMA: Muitos significativos (>50%)\n")
+  cat("   → Violação de parallel trends\n")
+}
+```
+
+```{r plot_trend, echo=TRUE, message=TRUE}
+# Salvando gráfico da estimativa dinâmica
+graph_event_tem3g <-ggdid(cs_agg_dynamic_correto_tem3G)
+print(graph_event_tem3g)
+```
+
+# ============================================================================
+# controle anos_3g
+# ============================================================================
+
+```{r estimar_CS_anos3g}
+# Estimar CS
+cs_controls_correto_anos3g <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g,  # Controle 3G: anos 36
+  data = dados_cs,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+cat("\n✅ Modelo estimado com sucesso!\n")
+```
+
+```{r}
+cs_agg_correto_anos3g <- aggte(cs_controls_correto_anos3g, type = "simple")
+
+cat(sprintf("\nATT médio: %.6f\n", cs_agg_correto_anos3g$overall.att))
+cat(sprintf("SE: %.6f\n", cs_agg_correto_anos3g$overall.se))
+
+z_stat <- cs_agg_correto_anos3g$overall.att / cs_agg_correto_anos3g$overall.se
+p_val <- 2 * pnorm(-abs(z_stat))
+
+cat(sprintf("P-valor: %.4f %s\n", p_val,
+            ifelse(p_val < 0.01, "***", 
+                   ifelse(p_val < 0.05, "**", 
+                          ifelse(p_val < 0.1, "*", "")))))
+
+baseline_mean <- mean(dados_cs$esteban_ray[dados_cs$tempo == min(dados_cs$tempo)])
+efeito_pct <- (cs_agg_correto_anos3g$overall.att / baseline_mean) * 100
+
+cat(sprintf("Efeito em %%: %+.2f%% da baseline (%.4f)\n", efeito_pct, baseline_mean))
+```
+
+```{r}
+cs_agg_dynamic_correto_anos3G <- aggte(
+  cs_controls_correto_anos3g, 
+  type = "dynamic",
+  balance_e = NULL
+)
+
+event_correto_df_anos3G <- data.frame(
+  tempo_rel = cs_agg_dynamic_correto_anos3G$egt,
+  att = cs_agg_dynamic_correto_anos3G$att.egt,
+  se = cs_agg_dynamic_correto_anos3G$se.egt
+) %>%
+  mutate(
+    ic_lower = att - 1.96 * se,
+    ic_upper = att + 1.96 * se,
+    pval = 2 * pnorm(-abs(att/se)),
+    sig = case_when(
+      pval < 0.01 ~ "***",
+      pval < 0.05 ~ "**",
+      pval < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+for(i in 1:nrow(event_correto_df_anos3G)) {
+  cat(sprintf("  t=%+3d: ATT=%+.6f, SE=%.6f, p=%.4f %s\n",
+              event_correto_df_anos3G$tempo_rel[i],
+              event_correto_df_anos3G$att[i],
+              event_correto_df_anos3G$se[i],
+              event_correto_df_anos3G$pval[i],
+              event_correto_df_anos3G$sig[i]))
+}
+```
+
+```{r}
+pre_correto <- event_correto_df_anos3G %>% filter(tempo_rel < 0)
+n_sig_correto <- sum(pre_correto$pval < 0.05)
+
+cat(sprintf("\nCoeficientes pré-tratamento: %d\n", nrow(pre_correto)))
+cat(sprintf("Significativos a 5%%: %d (%.1f%%)\n",
+            n_sig_correto,
+            n_sig_correto/nrow(pre_correto)*100))
+
+if(n_sig_correto == 0) {
+  cat("\n✅ EXCELENTE: Nenhum significativo!\n")
+  cat("   → Parallel trends válido\n")
+} else if(n_sig_correto <= nrow(pre_correto) * 0.25) {
+  cat("\n✅ BOM: Poucos significativos (<25%)\n")
+  cat("   → Parallel trends plausível\n")
+} else if(n_sig_correto <= nrow(pre_correto) * 0.5) {
+  cat("\n⚠️  MODERADO: Alguns significativos (25-50%)\n")
+  cat("   → Parallel trends questionável\n")
+} else {
+  cat("\n🚨 PROBLEMA: Muitos significativos (>50%)\n")
+  cat("   → Violação de parallel trends\n")
+}
+```
+
+```{r plot_trend, echo=TRUE, message=TRUE}
+# Salvando gráfico da estimativa dinâmica
+graph_event_anos3g <-ggdid(cs_agg_dynamic_correto_anos3G)
+print(graph_event_anos3g)
+```
+
+```{r estimar_CS_anos3g+tem3G}
+# Estimar CS
+cs_controls_controle3g <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ tem_3g + anos_3g, # Controle 3G: 
+  data = dados_cs,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+cat("\n✅ Modelo estimado com sucesso!\n")
+```
+
+```{r}
+cs_agg_controle3g <- aggte(cs_controls_controle3g, type = "simple")
+
+cat(sprintf("\nATT médio: %.6f\n", cs_agg_controle3g$overall.att))
+cat(sprintf("SE: %.6f\n", cs_agg_controle3g$overall.se))
+
+z_stat <- cs_agg_controle3g$overall.att / cs_agg_controle3g$overall.se
+p_val <- 2 * pnorm(-abs(z_stat))
+
+cat(sprintf("P-valor: %.4f %s\n", p_val,
+            ifelse(p_val < 0.01, "***", 
+                   ifelse(p_val < 0.05, "**", 
+                          ifelse(p_val < 0.1, "*", "")))))
+
+baseline_mean <- mean(dados_cs$esteban_ray[dados_cs$tempo == min(dados_cs$tempo)])
+efeito_pct <- (cs_agg_controle3g$overall.att / baseline_mean) * 100
+
+cat(sprintf("Efeito em %%: %+.2f%% da baseline (%.4f)\n", efeito_pct, baseline_mean))
+```

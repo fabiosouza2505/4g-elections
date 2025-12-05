@@ -1,0 +1,459 @@
+---
+title: "DID - 2021"
+author: "Fabio de Medeiros"
+date: "2025-11-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+# Instalar pacotes necessários
+install.packages("did")
+install.packages("tidyverse")
+install.packages("fixest")
+install.packages("modelsummary")
+install.packages("ggplot2")
+```
+
+# ============================================
+# CALLAWAY & SANT'ANNA (2021) EM R
+# ============================================
+
+```{r packages load}
+
+# Carregar pacotes
+library(did)
+library(tidyverse)
+library(fixest)
+library(modelsummary)
+library(ggplot2)
+library(dplyr)
+library(stats)
+```
+
+# ============================================
+# 1. CARREGAR E PREPARAR DADOS
+# ============================================
+
+```{r load_data}
+
+# Ler CSV do painel
+painel <- read.csv("painel_completo_event_study.csv", stringsAsFactors = FALSE)
+
+cat("✅ Dados carregados:\n")
+cat("   Observações:", nrow(painel), "\n")
+cat("   Municípios:", length(unique(painel$codigo_tse)), "\n")
+cat("   Anos:", paste(sort(unique(painel$ano)), collapse=", "), "\n\n")
+```
+
+# ============================================
+# 2. PREPARAR VARIÁVEIS
+# ============================================
+
+```{r preparing_var}
+
+# Converter codigo_tse para numérico (did requer ID numérico)
+painel$id_numeric <- as.numeric(as.factor(painel$codigo_tse))
+
+# Criar first_treat (ano de primeiro tratamento, 0 se never treated)
+painel <- painel %>%
+  mutate(
+    first_treat = ifelse(is.na(ano_primeira_4g), 0, ano_primeira_4g),
+    first_treat = as.integer(first_treat)
+  )
+
+# Remover NAs no outcome
+painel_clean <- painel %>%
+  filter(!is.na(esteban_ray))
+
+cat("Variáveis preparadas:\n")
+cat("   ID: id_numeric (numérico)\n")
+cat("   Ano: ano\n")
+cat("   Outcome: esteban_ray\n")
+cat("   Cohort: first_treat\n\n")
+
+# Distribuição de cohorts
+cat("Distribuição de cohorts:\n")
+print(table(painel_clean$first_treat))
+cat("\n")
+
+```
+
+# ============================================
+# 3. ESTIMAR CALLAWAY & SANT'ANNA
+# ============================================
+
+```{r callaway_estimate}
+# Modelo 1: Sem covariáveis
+cs_result <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id_numeric",
+  gname = "first_treat",
+  data = painel_clean,
+  est_method = "reg",  # Outcome regression
+  control_group = "notyettreated",
+  clustervars = "id_numeric",
+  base_period = "universal"  # Usar todos períodos pré-tratamento
+)
+```
+
+# ============================================
+# 4. OVERALL ATT
+# ============================================
+
+```{r}
+overall_att <- aggte(cs_result, type = "simple")
+print(overall_att)
+```
+
+```{r}
+overall_att_dynamic <- aggte(cs_result, type = "dynamic")
+print(overall_att_dynamic)
+```
+
+
+```{r}
+cat("Estimate:  ", sprintf("%.6f", overall_att$overall.att), "\n")
+cat("Std Error: ", sprintf("%.6f", overall_att$overall.se), "\n")
+  
+t_stat <- overall_att$overall.att / overall_att$overall.se
+p_val <- 2 * (1 - pnorm(abs(t_stat)))
+  
+cat("P-value:   ", sprintf("%.4f", p_val), "\n")
+  
+ci_lower <- overall_att$overall.att - 1.96 * overall_att$overall.se
+ci_upper <- overall_att$overall.att + 1.96 * overall_att$overall.se
+cat("95% CI:    [", sprintf("%.6f", ci_lower), ", ", 
+    sprintf("%.6f", ci_upper), "]\n", sep="")
+```
+
+
+# ============================================
+# 5. ATT POR COHORT
+# ============================================
+
+```{r att_cohort}
+
+cat(rep("=", 80), "\n", sep="")
+cat("5. ATT POR COHORT\n")
+cat(rep("=", 80), "\n\n", sep="")
+
+group_att <- aggte(cs_result, type = "group")
+
+cat(sprintf("%-15s %-12s %-12s %-10s\n", 
+            "Cohort", "ATT", "SE", "P-value"))
+cat(rep("-", 50), "\n", sep="")
+
+for (i in seq_along(group_att$egt)) {
+  g <- group_att$egt[i]
+  att_g <- group_att$att.egt[i]
+  se_g <- group_att$se.egt[i]
+  t_g <- att_g / se_g
+  p_g <- 2 * (1 - pnorm(abs(t_g)))
+  
+  cat(sprintf("%-15d %11.6f %11.6f %9.4f\n", g, att_g, se_g, p_g))
+}
+```
+
+# ============================================
+# 5. EVENT STUDY
+# ============================================
+
+```{r}
+event_att <- aggte(cs_result, type = "dynamic")
+print(event_att)
+```
+
+
+```{r event_att}
+
+cat(sprintf("%-12s %-12s %-12s %-10s %-5s\n", 
+            "Rel. Time", "ATT", "SE", "P-value", "Sig."))
+cat(rep("-", 55), "\n", sep="")
+
+for (i in seq_along(event_att$egt)) {
+  e <- event_att$egt[i]
+  att_e <- event_att$att.egt[i]
+  se_e <- event_att$se.egt[i]
+  
+  # PROTEÇÃO CONTRA NA
+  if (!is.na(att_e) && !is.na(se_e) && se_e > 0) {
+    t_e <- att_e / se_e
+    p_e <- 2 * (1 - pnorm(abs(t_e)))
+    
+    # Significância (com proteção)
+    sig_e <- ""
+    if (!is.na(p_e)) {
+      if (p_e < 0.01) sig_e <- "***"
+      else if (p_e < 0.05) sig_e <- "**"
+      else if (p_e < 0.10) sig_e <- "*"
+    }
+    
+    cat(sprintf("%-12d %11.6f %11.6f %9.4f %5s\n", 
+                e, att_e, se_e, p_e, sig_e))
+  } else {
+    # Se houver NA, imprimir mas sem p-valor
+    cat(sprintf("%-12d %11.6f %11.6f %9s %5s\n", 
+                e, 
+                ifelse(is.na(att_e), NA, att_e),
+                ifelse(is.na(se_e), NA, se_e),
+                "NA", ""))
+  }
+}
+```
+
+```{r plot_trend, echo=TRUE, message=TRUE}
+# Salvando gráfico da estimativa dinâmica
+graph_event <-ggdid(event_att)
+print(graph_event)
+```
+
+
+# ============================================
+# 6. GRÁFICO (COM PROTEÇÃO CONTRA NA)
+# ============================================
+
+```{r plot_event_study}
+# Criar dataframe removendo NAs
+event_df <- data.frame(
+  rel_time = event_att$egt,
+  att = event_att$att.egt,
+  se = event_att$se.egt
+)
+
+# Remover linhas com NA
+event_df <- event_df[!is.na(event_df$att) & !is.na(event_df$se), ]
+
+# Adicionar CIs
+event_df$ci_lower <- event_df$att - 1.96 * event_df$se
+event_df$ci_upper <- event_df$att + 1.96 * event_df$se
+
+cat("Períodos válidos no event study:", nrow(event_df), "\n\n")
+
+# Plot (SEM if statement se você tem certeza que há dados)
+p <- ggplot(event_df, aes(x = rel_time, y = att)) +
+  geom_line(color = "darkblue", linewidth = 1.2) +
+  geom_point(color = "darkblue", size = 3) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), 
+              alpha = 0.2, fill = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", 
+             color = "red", linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dotdash", 
+             color = "gray50", linewidth = 1.2) +
+  labs(
+    title = "Event Study: Callaway & Sant'Anna (2021)",
+    subtitle = "Not-Yet-Treated as Control",
+    x = "Anos Relativos ao Tratamento",
+    y = "ATT sobre Esteban-Ray"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Salvar e mostrar
+ggsave("event_study_CS_notyettreated.png", plot = p, 
+       width = 12, height = 7, dpi = 300)
+cat("✅ Gráfico salvo: event_study_CS_notyettreated.png\n\n")
+print(p)
+
+# Salvar dados
+write.csv(event_df, "cs_event_study_notyettreated.csv", row.names = FALSE)
+cat("✅ Dados salvos: cs_event_study_notyettreated.csv\n\n")
+```
+
+# ============================================
+# TESTE DE PRE-TRENDS
+# ============================================
+
+```{r pre_trends}
+# Períodos pré-tratamento
+pre_trends <- event_df[event_df$rel_time < 0, ]
+
+cat("Períodos pré-tratamento:", nrow(pre_trends), "\n\n")
+
+if (nrow(pre_trends) > 0) {
+  cat(sprintf("%-12s %-12s %-12s %-10s %-8s\n", 
+              "Rel. Time", "ATT", "SE", "P-value", "Sig?"))
+  cat(rep("-", 55), "\n", sep="")
+  
+  all_insig <- TRUE
+  sig_count <- 0
+  
+  for (i in 1:nrow(pre_trends)) {
+    row <- pre_trends[i, ]
+    t_pre <- row$att / row$se
+    p_pre <- 2 * (1 - pnorm(abs(t_pre)))
+    
+    sig_test <- "Não"
+    if (p_pre < 0.10) {
+      sig_test <- "Sim"
+      all_insig <- FALSE
+      sig_count <- sig_count + 1
+    }
+    
+    # Estrelas
+    stars <- ""
+    if (p_pre < 0.01) stars <- "***"
+    else if (p_pre < 0.05) stars <- "**"
+    else if (p_pre < 0.10) stars <- "*"
+    
+    cat(sprintf("%-12d %11.6f %11.6f %9.4f %8s %s\n", 
+                row$rel_time, row$att, row$se, p_pre, sig_test, stars))
+  }
+  
+  cat(rep("-", 55), "\n", sep="")
+  cat("\nRESUMO DO TESTE:\n")
+  cat("Total períodos pré-tratamento:", nrow(pre_trends), "\n")
+  cat("Períodos significativos (p<0.10):", sig_count, "\n")
+  cat("Proporção significativa:", sprintf("%.1f%%", 100*sig_count/nrow(pre_trends)), "\n\n")
+  
+  if (all_insig) {
+    cat("✅ PARALLEL TRENDS VALIDADO\n")
+    cat("   → Nenhum coeficiente pré-tratamento é significativo\n")
+    cat("   → Assumo de parallel trends é plausível\n")
+    cat("   → Resultados C&S são confiáveis\n\n")
+  } else if (sig_count <= 2) {
+    cat("⚠️  PARALLEL TRENDS PARCIALMENTE VALIDADO\n")
+    cat("   →", sig_count, "de", nrow(pre_trends), "períodos são significativos\n")
+    cat("   → Possível violação menor de parallel trends\n")
+    cat("   → Interpretar resultados com cautela moderada\n\n")
+  } else {
+    cat("🚨 PARALLEL TRENDS VIOLADO\n")
+    cat("   →", sig_count, "de", nrow(pre_trends), "períodos são significativos\n")
+    cat("   → Violação severa de parallel trends\n")
+    cat("   → Grupos eram sistematicamente diferentes antes do tratamento\n")
+    cat("   → Resultados podem estar ENVIESADOS\n")
+    cat("   → Considerar métodos alternativos (synthetic control, matching)\n\n")
+  }
+  
+  # Gráfico destacando pre-trends
+  p_pretrends <- ggplot(pre_trends, aes(x = rel_time, y = att)) +
+    geom_line(color = "darkred", linewidth = 1.2) +
+    geom_point(color = "darkred", size = 3) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), 
+                alpha = 0.2, fill = "red") +
+    geom_hline(yintercept = 0, linetype = "dashed", 
+               color = "black", linewidth = 1) +
+    labs(
+      title = "Pre-Trends Test: Períodos Pré-Tratamento",
+      subtitle = paste0(sig_count, " de ", nrow(pre_trends), 
+                       " períodos significativos (p<0.10)"),
+      x = "Anos Relativos ao Tratamento",
+      y = "ATT sobre Esteban-Ray"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+      axis.title = element_text(face = "bold")
+    )
+  
+  ggsave("pretrends_test.png", plot = p_pretrends, 
+         width = 10, height = 6, dpi = 300)
+  cat("✅ Gráfico de pre-trends salvo: pretrends_test.png\n\n")
+  
+} else {
+  cat("⚠️  Não há períodos pré-tratamento disponíveis\n\n")
+}
+```
+# ============================================
+# MOSTRAR event_df PARA REFERÊNCIA
+# ============================================
+
+```{r dados_event_study}
+
+print(head(event_df, 5))
+print(tail(event_df, 5))
+```
+
+# ============================================
+# VISUALIZAÇÃO: TRATADOS vs CONTROLES
+# ============================================
+
+```{r tendencias}
+
+library(ggplot2)
+library(dplyr)
+
+# Carregar painel
+painel <- read.csv("painel_completo_event_study.csv", stringsAsFactors = FALSE)
+
+# Criar variável de grupo para visualização
+# Vamos focar em um cohort específico (ex: 2018) vs never-treated
+
+# Definir grupos
+painel$grupo <- NA
+painel$grupo[painel$ano_primeira_4g >= 2018 & painel$ano_primeira_4g < 2022] <- "Tratado 2018"
+painel$grupo[is.na(painel$ano_primeira_4g) | painel$ano_primeira_4g > 2022] <- "Nunca Tratado"
+
+# Remover outros cohorts para visualização limpa
+painel_viz <- painel[!is.na(painel$grupo), ]
+painel_viz <- painel_viz[!is.na(painel_viz$esteban_ray), ]
+
+cat("Grupos para visualização:\n")
+print(table(painel_viz$grupo, painel_viz$ano))
+cat("\n")
+
+# Calcular médias por grupo e ano
+tendencias <- painel_viz %>%
+  group_by(ano, grupo) %>%
+  summarise(
+    er_medio = mean(esteban_ray, na.rm = TRUE),
+    er_se = sd(esteban_ray, na.rm = TRUE) / sqrt(n()),
+    n = n()
+  ) %>%
+  ungroup()
+
+print(tendencias)
+```
+
+# ============================================
+# GRÁFICO 1: NÍVEIS SEPARADOS
+# ============================================
+
+```{r plot1_tendencias}
+p1 <- ggplot(tendencias, aes(x = ano, y = er_medio, color = grupo, group = grupo)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 4) +
+  geom_ribbon(aes(ymin = er_medio - 1.96*er_se, 
+                  ymax = er_medio + 1.96*er_se,
+                  fill = grupo), 
+              alpha = 0.2, color = NA) +
+  geom_vline(xintercept = 2018, linetype = "dashed", 
+             color = "red", linewidth = 1.2) +
+  annotate("text", x = 2018, y = max(tendencias$er_medio), 
+           label = "Tratamento\n(2018)", vjust = -0.5, color = "red") +
+  scale_color_manual(values = c("Tratado 2018" = "darkblue", 
+                                 "Nunca Tratado" = "gray40")) +
+  scale_fill_manual(values = c("Tratado 2018" = "blue", 
+                                "Nunca Tratado" = "gray40")) +
+  labs(
+    title = "Parallel Trends Test: Níveis de Polarização",
+    subtitle = "Cohort 2018 vs Never-Treated",
+    x = "Ano",
+    y = "Índice de Esteban-Ray (Médio)",
+    color = "Grupo",
+    fill = "Grupo"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("parallel_trends_niveis.png", plot = p1, width = 12, height = 7, dpi = 300)
+cat("✅ Gráfico de níveis salvo: parallel_trends_niveis.png\n\n")
+print(p1)
+
+```

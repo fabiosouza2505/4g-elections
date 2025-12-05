@@ -1,0 +1,333 @@
+---
+title: "DoseResponse4G"
+author: "Fabio de Medeiros"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(did)
+library(fixest)
+library(data.table)
+library(stats)
+```
+
+# 1. CARREGAR DADOS COM INTENSIDADE 4G
+
+```{r load_data}
+dados <- fread("painel_com_intensidade_4g.csv",
+               colClasses = c(codigo_tse = "character"))
+
+cat(sprintf("   Observações: %s\n", nrow(dados)))
+cat(sprintf("   Municípios: %s\n", n_distinct(dados$codigo_tse)))
+cat(sprintf("   Anos: %s\n\n", paste(sort(unique(dados$ano)), collapse=", ")))
+
+```
+
+# 2. PREPARAR DADOS
+
+```{r preparing_data}
+
+dados <- dados %>%
+  mutate(
+    id = as.numeric(factor(codigo_tse)),
+    tempo = as.integer(ano),
+    # Controles 3G
+    tem_3g = replace_na(tem_3g, 0),
+    anos_3g = replace_na(anos_3g, 0),
+    # Intensidade 4G
+    erbs_per_1000hab = replace_na(erbs_per_1000hab, 0),
+    intensidade_4g_norm = replace_na(intensidade_4g_norm, 0),
+    total_erbs_4g = replace_na(total_erbs_4g, 0)
+  )
+
+# Criar gname
+nunca_tratados_4g <- dados %>%
+  group_by(codigo_tse) %>%
+  summarise(max_4g = max(tem_4g, na.rm = TRUE)) %>%
+  filter(max_4g == 0) %>%
+  pull(codigo_tse)
+
+dados <- dados %>%
+  mutate(
+    gname = case_when(
+      codigo_tse %in% nunca_tratados_4g ~ 0L,
+      !is.na(ano_primeira_4g) ~ as.integer(ano_primeira_4g),
+      TRUE ~ 0L
+    )
+  )
+
+cat(sprintf("✅ Dados preparados\n"))
+cat(sprintf("   Nunca tratados: %s municípios\n", length(nunca_tratados_4g)))
+cat(sprintf("   Cohorts: %s\n\n", n_distinct(dados$gname[dados$gname > 0])))
+
+```
+
+# 3. ESTATÍSTICAS DESCRITIVAS - INTENSIDADE 4G
+
+```{r stats}
+# Distribuição de intensidade
+cat("📊 INTENSIDADE 4G (ERBs por 1000 hab):\n\n")
+print(summary(dados$erbs_per_1000hab[dados$erbs_per_1000hab > 0]))
+cat("\n")
+
+# Por ano
+cat("📅 INTENSIDADE MÉDIA POR ANO:\n\n")
+intensidade_ano <- dados %>%
+  group_by(ano) %>%
+  summarise(
+    media = mean(erbs_per_1000hab, na.rm = TRUE),
+    mediana = median(erbs_per_1000hab, na.rm = TRUE),
+    max = max(erbs_per_1000hab, na.rm = TRUE),
+    n_com_4g = sum(total_erbs_4g > 0),
+    .groups = "drop"
+  )
+
+print(intensidade_ano)
+cat("\n")
+
+# Correlação entre 4G e 3G
+cat("🔗 CORRELAÇÃO 3G vs 4G:\n\n")
+cor_3g_4g <- cor(dados$anos_3g, dados$erbs_per_1000hab, use = "complete.obs")
+cat(sprintf("   Correlação anos_3g vs erbs_per_1000hab: %.3f\n\n", cor_3g_4g))
+
+```
+
+# 4. MODELO 1: DOSE-RESPONSE LINEAR (ERBs contínua)
+
+```{r}
+cs_dose_linear <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g + erbs_per_1000hab,  # DOSE CONTÍNUA
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+# ATT médio
+cs_dose_agg <- aggte(cs_dose_linear, type = "simple")
+
+cat(sprintf("ATT médio: %.6f\n", cs_dose_agg$overall.att))
+cat(sprintf("SE: %.6f\n", cs_dose_agg$overall.se))
+
+z_stat <- cs_dose_agg$overall.att / cs_dose_agg$overall.se
+p_val <- 2 * pnorm(-abs(z_stat))
+
+cat(sprintf("P-valor: %.4f %s\n\n", p_val,
+            ifelse(p_val < 0.01, "***", 
+                   ifelse(p_val < 0.05, "**", 
+                          ifelse(p_val < 0.1, "*", "")))))
+
+# Event study
+cs_dose_dynamic <- aggte(cs_dose_linear, type = "dynamic", balance_e = NULL)
+
+event_dose_df <- data.frame(
+  tempo_rel = cs_dose_dynamic$egt,
+  att = cs_dose_dynamic$att.egt,
+  se = cs_dose_dynamic$se.egt
+) %>%
+  mutate(
+    ic_lower = att - 1.96 * se,
+    ic_upper = att + 1.96 * se,
+    pval = 2 * pnorm(-abs(att/se)),
+    sig = case_when(
+      pval < 0.01 ~ "***",
+      pval < 0.05 ~ "**",
+      pval < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+cat("📈 EVENT STUDY:\n\n")
+for(i in 1:nrow(event_dose_df)) {
+  cat(sprintf("  t=%+3d: ATT=%+.6f, SE=%.6f, p=%.4f %s\n",
+              event_dose_df$tempo_rel[i],
+              event_dose_df$att[i],
+              event_dose_df$se[i],
+              event_dose_df$pval[i],
+              event_dose_df$sig[i]))
+}
+
+# Pré-tendências
+pre_dose <- event_dose_df %>% filter(tempo_rel < 0)
+n_sig_dose <- sum(pre_dose$pval < 0.05)
+
+cat(sprintf("\nPré-tendências: %d/%d significativas (%.1f%%)\n\n",
+            n_sig_dose, nrow(pre_dose),
+            n_sig_dose/nrow(pre_dose)*100))
+
+# Gráfico
+graph_dose <- ggdid(cs_dose_dynamic)
+print(graph_dose)
+
+```
+
+# 5. MODELO 2: HETEROGENEIDADE POR INTENSIDADE (Alta vs Baixa)
+
+```{r}
+# Usar mediana entre municípios tratados
+mediana_intensidade <- median(dados$erbs_per_1000hab[dados$total_erbs_4g > 0])
+
+cat(sprintf("📊 Mediana de intensidade: %.3f ERBs/1000hab\n\n", mediana_intensidade))
+
+# 5.1 ALTA INTENSIDADE
+cat("🔼 ESTIMANDO: Alta Intensidade (acima da mediana)\n\n")
+
+dados_alta <- dados %>%
+  filter(
+    gname == 0 |  # Never-treated como controle
+    (gname > 0 & erbs_per_1000hab >= mediana_intensidade)  # Tratados alta intensidade
+  )
+
+cs_alta <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g,
+  data = dados_alta,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+cs_alta_agg <- aggte(cs_alta, type = "simple")
+
+cat(sprintf("ATT médio (alta): %.6f (SE=%.6f, p=%.4f)\n",
+            cs_alta_agg$overall.att,
+            cs_alta_agg$overall.se,
+            2 * pnorm(-abs(cs_alta_agg$overall.att / cs_alta_agg$overall.se))))
+
+# 5.2 BAIXA INTENSIDADE
+cat("\n🔽 ESTIMANDO: Baixa Intensidade (abaixo da mediana)\n\n")
+
+dados_baixa <- dados %>%
+  filter(
+    gname == 0 |  # Never-treated como controle
+    (gname > 0 & erbs_per_1000hab > 0 & erbs_per_1000hab < mediana_intensidade)
+  )
+
+cs_baixa <- att_gt(
+  yname = "esteban_ray",
+  tname = "tempo",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g,
+  data = dados_baixa,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE,
+  allow_unbalanced_panel = TRUE
+)
+
+cs_baixa_agg <- aggte(cs_baixa, type = "simple")
+
+cat(sprintf("ATT médio (baixa): %.6f (SE=%.6f, p=%.4f)\n\n",
+            cs_baixa_agg$overall.att,
+            cs_baixa_agg$overall.se,
+            2 * pnorm(-abs(cs_baixa_agg$overall.att / cs_baixa_agg$overall.se))))
+
+# Comparação
+cat("📊 COMPARAÇÃO:\n\n")
+cat(sprintf("   Alta intensidade: %.6f\n", cs_alta_agg$overall.att))
+cat(sprintf("   Baixa intensidade: %.6f\n", cs_baixa_agg$overall.att))
+cat(sprintf("   Diferença: %.6f\n", cs_alta_agg$overall.att - cs_baixa_agg$overall.att))
+```
+
+# 6. MODELO 3: CATEGORIAS DE INTENSIDADE
+
+```{r}
+# Estimar para cada categoria
+categorias <- c("Baixa", "Média", "Alta")
+resultados_cat <- list()
+
+for(cat_name in categorias) {
+  cat(sprintf("📊 Categoria: %s\n", cat_name))
+  
+  dados_cat <- dados %>%
+    filter(
+      gname == 0 | 
+      (gname > 0 & categoria_4g == cat_name)
+    )
+  
+  if(sum(dados_cat$gname > 0) < 50) {
+    cat(sprintf("   ⚠️  Poucos municípios (%d), pulando...\n\n", 
+                sum(dados_cat$gname > 0)))
+    next
+  }
+  
+  cs_cat <- att_gt(
+    yname = "esteban_ray",
+    tname = "tempo",
+    idname = "id",
+    gname = "gname",
+    xformla = ~ anos_3g,
+    data = dados_cat,
+    control_group = "notyettreated",
+    est_method = "reg",
+    print_details = FALSE,
+    allow_unbalanced_panel = TRUE
+  )
+  
+  cs_cat_agg <- aggte(cs_cat, type = "simple")
+  
+  resultados_cat[[cat_name]] <- list(
+    att = cs_cat_agg$overall.att,
+    se = cs_cat_agg$overall.se,
+    n = sum(dados_cat$gname > 0)
+  )
+  
+  cat(sprintf("   ATT: %.6f (SE=%.6f)\n", 
+              cs_cat_agg$overall.att, cs_cat_agg$overall.se))
+  cat(sprintf("   N: %d municípios\n\n", sum(dados_cat$gname > 0)))
+}
+
+```
+
+# 7. RESUMO COMPARATIVO
+
+```{r}
+cat("| Especificação                | ATT      | SE       | P-valor |\n")
+cat("|------------------------------|----------|----------|----------|\n")
+
+cat(sprintf("| Dose linear (contínua)       | %+.6f | %.6f | %.4f   |\n",
+            cs_dose_agg$overall.att,
+            cs_dose_agg$overall.se,
+            2 * pnorm(-abs(cs_dose_agg$overall.att / cs_dose_agg$overall.se))))
+
+cat(sprintf("| Alta intensidade             | %+.6f | %.6f | %.4f   |\n",
+            cs_alta_agg$overall.att,
+            cs_alta_agg$overall.se,
+            2 * pnorm(-abs(cs_alta_agg$overall.att / cs_alta_agg$overall.se))))
+
+cat(sprintf("| Baixa intensidade            | %+.6f | %.6f | %.4f   |\n",
+            cs_baixa_agg$overall.att,
+            cs_baixa_agg$overall.se,
+            2 * pnorm(-abs(cs_baixa_agg$overall.att / cs_baixa_agg$overall.se))))
+```
+

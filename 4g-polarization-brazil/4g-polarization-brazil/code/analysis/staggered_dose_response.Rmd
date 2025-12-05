@@ -1,0 +1,143 @@
+---
+title: "Staggered_dose_response"
+author: "Fabio de Medeiros"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(did)
+library(fixest)
+library(stats)
+```
+
+# Carregar dados
+
+```{r load_data}
+dados <- read_csv("painel_com_intensidade_4g.csv",
+                  col_types = cols(codigo_tse = col_character()))
+```
+
+# 1. PREPARAR DADOS: Criar gname baseado em primeiro ano com 4G
+
+```{r}
+# Mapeamento codigo_tse → id numérico
+mapeamento_id <- dados %>%
+  distinct(codigo_tse) %>%
+  arrange(codigo_tse) %>%
+  mutate(id = row_number())
+
+dados <- dados %>%
+  left_join(mapeamento_id, by = "codigo_tse")
+```
+
+
+```{r preparing_data}
+# Identificar primeiro ano que município recebeu 4G
+
+dados <- dados %>%
+  group_by(codigo_tse) %>%
+  arrange(codigo_tse, ano) %>%
+  mutate(
+    # Primeiro ano com 4G
+    primeiro_ano_4g = ifelse(any(total_erbs_4g > 0), 
+                             min(ano[total_erbs_4g > 0]), 
+                             0),
+    
+    # Gname para CS (NA para never-treated)
+    gname = ifelse(primeiro_ano_4g == 0, NA, primeiro_ano_4g)
+  ) %>%
+  ungroup()
+
+
+# Verificar distribuição de cohort
+cat("📊 DISTRIBUIÇÃO DOS COHORTS:\n\n")
+cohort_dist <- dados %>%
+  distinct(codigo_tse, gname) %>%
+  group_by(gname) %>%
+  summarise(n_municipios = n()) %>%
+  arrange(gname)
+
+print(cohort_dist)
+cat("\n")
+
+# Estatísticas de intensidade POR COHORT
+cat("📊 INTENSIDADE MÉDIA POR COHORT (no ano de adoção):\n\n")
+intensidade_cohort <- dados %>%
+  filter(!is.na(gname), ano == gname) %>%
+  group_by(gname) %>%
+  summarise(
+    n = n(),
+    media_erbs = mean(erbs_per_1000hab, na.rm = TRUE),
+    mediana_erbs = median(erbs_per_1000hab, na.rm = TRUE),
+    min_erbs = min(erbs_per_1000hab, na.rm = TRUE),
+    max_erbs = max(erbs_per_1000hab, na.rm = TRUE)
+  )
+
+print(intensidade_cohort)
+```
+
+# 2. MODELO DOSE-RESPONSE STAGGERED: Intensidade como covariada
+
+```{r cs_dose_staggered}
+
+cat("Especificação:\n")
+cat("  xformla = ~ anos_3g + erbs_per_1000hab\n")
+cat("  control_group = notyettreated\n")
+cat("  est_method = reg (regressão)\n\n")
+
+# Estimar
+cs_dose_staggered <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id",
+  gname = "gname",
+  
+  # DOSE-RESPONSE: intensidade como covariada contínua
+  xformla = ~ anos_3g + erbs_per_1000hab,
+  
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",  # Importante para covariadas contínuas
+  base_period = "universal",
+  anticipation = 0,
+  print_details = FALSE,
+  panel = FALSE
+)
+
+# Agregação simples
+agg_dose <- aggte(cs_dose_staggered, type = "simple")
+
+cat("✅ Estimação concluída\n\n")
+cat("RESULTADO - ATT MÉDIO:\n")
+cat(sprintf("  ATT: %.6f\n", agg_dose$overall.att))
+cat(sprintf("  SE:  %.6f\n", agg_dose$overall.se))
+cat(sprintf("  P-valor: %.4f\n", 
+            2 * pnorm(-abs(agg_dose$overall.att / agg_dose$overall.se))))
+cat("\n")
+
+# Event study dinâmico
+cat("Estimando event study dinâmico...\n")
+agg_dose_dynamic <- aggte(cs_dose_staggered, type = "dynamic")
+
+```
+

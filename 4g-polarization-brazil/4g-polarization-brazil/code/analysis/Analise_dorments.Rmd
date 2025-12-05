@@ -1,0 +1,86 @@
+---
+title: "Dorments"
+author: "Fabio de Medeiros"
+date: "2025-11-25"
+output: html_document
+---
+
+## Setup inicial
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  fig.align = "center"
+)
+```
+
+## Debug output
+
+```{r debug_output}
+# Ativar modo verbose para debug
+options(knitr.duplicate.label = "allow")
+knitr::opts_chunk$set(
+  comment = "",
+  message = TRUE,
+  warning = TRUE
+)
+```
+
+## Limpeza de ambiente
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+## Instalação de pacotes
+
+```{r packages, echo=TRUE, message=TRUE, warning=TRUE}
+
+pacotes <- c("tidyverse", "fixest", "dplyr", "ggplot2", "tidyr", "readr","texreg")
+for (pkg in pacotes) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+## Carregamento de dados
+
+```{r data_load, echo=TRUE, message=TRUE, warning=TRUE}
+# Carregar dados
+painel <- read.csv("painel_completo_event_study.csv", stringsAsFactors = FALSE)
+```
+
+```{r checking_file}
+# Verificar se arquivo existe
+if (!file.exists("painel_completo_event_study.csv")) {
+  cat("❌ ERRO: Arquivo não encontrado!\n")
+  cat("   Verifique se o arquivo está no diretório de trabalho:\n")
+  cat("   ", getwd(), "\n\n")
+} else {
+  cat("✅ Arquivo encontrado\n\n")
+  
+  # Ver tamanho do arquivo
+  tamanho <- file.size("painel_completo_event_study.csv")
+  cat("Tamanho do arquivo:", format(tamanho, big.mark = ","), "bytes\n\n")
+}
+```
+
+```{r}
+# Ler primeiras linhas RAW (sem processar)
+
+primeiras_linhas <- readLines("painel_completo_event_study.csv", n = 5, warn = FALSE)
+for (i in 1:length(primeiras_linhas)) {
+  cat("Linha", i, ":", primeiras_linhas[i], "\n")
+}
+
+# Detectar encoding
+encoding_detectado <- guess_encoding("painel_completo_event_study.csv", n_max = 1000)
+print(encoding_detectado)
+```
+
