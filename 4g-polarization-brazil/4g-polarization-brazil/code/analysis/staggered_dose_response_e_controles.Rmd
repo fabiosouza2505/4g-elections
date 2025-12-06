@@ -1,0 +1,911 @@
+---
+title: "staggered_dose_response_e_controles"
+author: "Fabio de Medeiros"
+date: "2025-12-06"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(did)
+library(fixest)
+library(stats)
+```
+
+# ============================================================================
+# DOSE-RESPONSE STAGGERED COM CONTROLE DE PIB
+# Versão Simplificada - Tudo no R
+# ============================================================================
+
+```{r load_data}
+
+# ============================================================================
+# PASSO 1: CARREGAR PAINEL PRINCIPAL (já tem população!)
+# ============================================================================
+
+dados <- read_csv("painel_com_intensidade_4g.csv",
+                  col_types = cols(codigo_tse = col_character()))
+
+cat(sprintf("✅ Painel carregado: %d linhas\n", nrow(dados)))
+cat(sprintf("   Municípios: %d\n", n_distinct(dados$codigo_tse)))
+cat(sprintf("   Anos: %s\n\n", paste(unique(dados$ano), collapse=", ")))
+
+# Verificar se tem população
+if(!"populacao" %in% names(dados)) {
+  cat("❌ ERRO: Variável 'populacao' não encontrada no painel!\n")
+  cat("   Execute primeiro o script que adiciona população.\n")
+  stop()
+}
+
+cat("✅ População disponível no painel\n\n")
+
+# ============================================================================
+# PASSO 2: CARREGAR PIB DO IBGE
+# ============================================================================
+
+# Carregar PIB
+
+# Tentar diferentes encodings/separadores
+tryCatch({
+  df_pib <- read_csv("pib_municipal_2010_2022.csv")
+}, error = function(e) {
+  tryCatch({
+    df_pib <- read_csv2("pib_municipal_2010_2022.csv")  # sep=';'
+  }, error = function(e) {
+    df_pib <- read.csv("pib_municipal_2010_2022.csv", 
+                       sep=";", dec=",", encoding="latin1")
+  })
+})
+
+cat(sprintf("✅ PIB carregado: %d linhas\n\n", nrow(df_pib)))
+
+# ============================================================================
+# PASSO 3: FILTRAR E PROCESSAR PIB
+# ============================================================================
+
+# Identificar nomes de colunas (podem variar)
+col_var_codigo <- names(df_pib)[grepl("Variável.*Código", names(df_pib))][1]
+col_valor <- names(df_pib)[grepl("Valor", names(df_pib))][1]
+col_mun_codigo <- names(df_pib)[grepl("Município.*Código", names(df_pib))][1]
+col_mun_nome <- names(df_pib)[grepl("Município", names(df_pib)) & 
+                                !grepl("Código", names(df_pib))][1]
+col_ano <- names(df_pib)[grepl("Ano", names(df_pib)) & 
+                          !grepl("Código", names(df_pib))][1]
+
+cat(sprintf("Colunas identificadas:\n"))
+cat(sprintf("  Variável Código: %s\n", col_var_codigo))
+cat(sprintf("  Valor: %s\n", col_valor))
+cat(sprintf("  Município Código: %s\n", col_mun_codigo))
+cat(sprintf("  Ano: %s\n\n", col_ano))
+
+# Filtrar código 37 (PIB Total)
+pib_total <- df_pib %>%
+  filter(.data[[col_var_codigo]] == 37) %>%
+  select(
+    codigo_ibge = all_of(col_mun_codigo),
+    nome_municipio = all_of(col_mun_nome),
+    ano = all_of(col_ano),
+    pib_total = all_of(col_valor)
+  )
+
+cat(sprintf("✅ PIB Total filtrado: %d linhas\n\n", nrow(pib_total)))
+
+# Filtrar anos eleitorais
+pib_total <- pib_total %>%
+  filter(ano %in% c(2010, 2014, 2018, 2021))
+
+cat(sprintf("Anos: %s\n", paste(unique(pib_total$ano), collapse=", ")))
+cat(sprintf("Linhas: %d\n\n", nrow(pib_total)))
+
+# Limpar e converter
+pib_total <- pib_total %>%
+  mutate(
+    codigo_ibge = as.integer(codigo_ibge),
+    pib_total = as.numeric(pib_total) * 1000  # Mil reais → Reais
+  ) %>%
+  filter(!is.na(pib_total))
+
+cat("✅ PIB convertido para reais\n\n")
+
+# ============================================================================
+# PASSO 4: CONVERTER IBGE → TSE
+# ============================================================================
+
+# Carregar tabela de-para
+tryCatch({
+  # Usar mesma configuração do notebook Python
+  depara <- read_delim(
+    "depara-ibge-tse.csv",
+    delim = ";",
+    locale = locale(encoding = "latin1"),
+    show_col_types = FALSE
+  )
+  
+  # Padronizar nomes
+  if("CD_MUNICIPIO_IBGE" %in% names(depara)) {
+    depara <- depara %>%
+      rename(
+        codigo_ibge = CD_MUNICIPIO_IBGE,
+        codigo_tse = CD_MUNICIPIO_TSE
+      )
+  }
+  
+  # Garantir tipos corretos
+  depara <- depara %>%
+    mutate(
+      codigo_ibge = as.integer(codigo_ibge),
+      codigo_tse = as.integer(codigo_tse)
+    )
+  
+  cat(sprintf("✅ Tabela de-para: %d correspondências\n\n", nrow(depara)))
+  
+  # Merge PIB + de-para
+  pib_com_tse <- pib_total %>%
+    left_join(depara %>% select(codigo_ibge, codigo_tse), by = "codigo_ibge")
+  
+  # Verificar match
+  n_sem_tse <- sum(is.na(pib_com_tse$codigo_tse))
+  pct_match <- 100 * (1 - n_sem_tse / nrow(pib_com_tse))
+  
+  cat(sprintf("Match IBGE→TSE: %.1f%%\n", pct_match))
+  
+  if(n_sem_tse > 0) {
+    cat(sprintf("⚠️ %d linhas sem código TSE (removidas)\n", n_sem_tse))
+    pib_com_tse <- pib_com_tse %>% filter(!is.na(codigo_tse))
+  }
+  
+}, error = function(e) {
+  cat("⚠️ Tabela de-para não encontrada\n")
+  cat("   Usando conversão aproximada (últimos 5 dígitos)\n\n")
+  
+  pib_com_tse <- pib_total %>%
+    mutate(codigo_tse = str_sub(as.character(codigo_ibge), -5))
+})
+
+# Padronizar codigo_tse
+pib_com_tse <- pib_com_tse %>%
+  mutate(codigo_tse = str_pad(codigo_tse, 5, pad = "0"))
+
+cat(sprintf("\n✅ Linhas com código TSE: %d\n\n", nrow(pib_com_tse)))
+
+# ============================================================================
+# PASSO 5: ADICIONAR DADOS DE 2022 (proxy com 2021)
+# ============================================================================
+
+pib_2021 <- pib_com_tse %>% filter(ano == 2021)
+pib_2022 <- pib_2021 %>% mutate(ano = 2022)
+
+pib_final <- bind_rows(pib_com_tse, pib_2022) %>%
+  filter(ano %in% c(2010, 2014, 2018, 2022))
+
+cat(sprintf("✅ Dados de 2022 adicionados: %d municípios\n\n", nrow(pib_2022)))
+
+# ============================================================================
+# PASSO 6: MERGE COM PAINEL PRINCIPAL
+# ============================================================================
+
+# Antes do merge - verificar dimensões
+cat(sprintf("Painel antes: %d linhas\n", nrow(dados)))
+
+# Merge
+dados <- dados %>%
+  left_join(
+    pib_final %>% select(codigo_tse, ano, pib_total, nome_municipio),
+    by = c("codigo_tse", "ano")
+  )
+
+cat(sprintf("Painel depois: %d linhas\n\n", nrow(dados)))
+
+# Verificar cobertura
+n_com_pib <- sum(!is.na(dados$pib_total))
+pct_cobertura <- 100 * n_com_pib / nrow(dados)
+
+cat(sprintf("Cobertura PIB: %.1f%% (%d/%d)\n\n", 
+            pct_cobertura, n_com_pib, nrow(dados)))
+
+if(pct_cobertura < 90) {
+  cat("⚠️ ATENÇÃO: Cobertura de PIB < 90%\n")
+  cat("   Alguns municípios não têm dados de PIB\n\n")
+}
+
+# ============================================================================
+# PASSO 7: CALCULAR PIB PER CAPITA
+# ============================================================================
+
+dados <- dados %>%
+  mutate(
+    pib_per_capita = pib_total / populacao,
+    log_pib_pc = log(pib_per_capita + 1)
+  )
+
+cat("✅ PIB per capita calculado!\n\n")
+
+# Estatísticas
+cat("Estatísticas PIB per capita por ano:\n")
+stats_pib <- dados %>%
+  group_by(ano) %>%
+  summarise(
+    n = sum(!is.na(pib_per_capita)),
+    media = mean(pib_per_capita, na.rm = TRUE),
+    mediana = median(pib_per_capita, na.rm = TRUE),
+    min = min(pib_per_capita, na.rm = TRUE),
+    max = max(pib_per_capita, na.rm = TRUE)
+  )
+
+print(stats_pib)
+cat("\n")
+
+# ============================================================================
+# PASSO 8: SALVAR PAINEL COMPLETO (OPCIONAL)
+# ============================================================================
+
+cat("Deseja salvar painel com PIB? (s/n): ")
+# Comentar linha abaixo se rodar sem interação
+# resposta <- tolower(readline())
+resposta <- "s"  # Salvar automaticamente
+
+if(resposta == "s") {
+  write_csv(dados, "painel_com_intensidade_4g_e_PIB.csv")
+  cat("✅ Salvo: painel_com_intensidade_4g_e_PIB.csv\n\n")
+}
+
+# ============================================================================
+# ANÁLISE: DOSE-RESPONSE COM CONTROLE DE PIB
+# ============================================================================
+
+# Preparar para Callaway-Sant'Anna
+cat("📊 Preparando dados para CS...\n")
+
+# ID numérico
+mapeamento_id <- dados %>%
+  distinct(codigo_tse) %>%
+  arrange(codigo_tse) %>%
+  mutate(id = row_number())
+
+dados <- dados %>%
+  left_join(mapeamento_id, by = "codigo_tse")
+
+# Gname
+dados <- dados %>%
+  group_by(id) %>%
+  arrange(id, ano) %>%
+  mutate(
+    primeiro_ano_4g = ifelse(any(tem_4g == 1), min(ano[tem_4g == 1]), 0),
+    gname = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g)
+  ) %>%
+  ungroup()
+
+cat("✅ Dados preparados\n\n")
+
+cat("Distribuição de cohorts:\n")
+cohort_dist <- dados %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  arrange(gname)
+print(cohort_dist)
+cat("\n")
+
+# ============================================================================
+# MODELO 1: SEM CONTROLE DE PIB (baseline)
+# ============================================================================
+
+cat("xformla = ~ anos_3g + erbs_per_1000hab\n\n")
+
+cs_sem_pib <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g + erbs_per_1000hab,
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",
+  base_period = "universal",
+  anticipation = 0,
+  print_details = FALSE
+)
+
+agg_sem_pib <- aggte(cs_sem_pib, type = "simple")
+
+cat("RESULTADO (SEM PIB):\n")
+cat(sprintf("  ATT: %+.6f\n", agg_sem_pib$overall.att))
+cat(sprintf("  SE:  %.6f\n", agg_sem_pib$overall.se))
+cat(sprintf("  P-valor: %.4f\n\n", 
+            2 * pnorm(-abs(agg_sem_pib$overall.att / agg_sem_pib$overall.se))))
+
+# ============================================================================
+# MODELO 2: COM CONTROLE DE PIB
+# ============================================================================
+
+cat("xformla = ~ anos_3g + erbs_per_1000hab + log_pib_pc\n\n")
+
+cs_com_pib <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g + erbs_per_1000hab + log_pib_pc,
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",
+  base_period = "universal",
+  anticipation = 0,
+  print_details = FALSE
+)
+
+agg_com_pib <- aggte(cs_com_pib, type = "simple")
+
+cat("RESULTADO (COM PIB):\n")
+cat(sprintf("  ATT: %+.6f\n", agg_com_pib$overall.att))
+cat(sprintf("  SE:  %.6f\n", agg_com_pib$overall.se))
+cat(sprintf("  P-valor: %.4f\n\n", 
+            2 * pnorm(-abs(agg_com_pib$overall.att / agg_com_pib$overall.se))))
+
+# ============================================================================
+# COMPARAÇÃO
+# ============================================================================
+
+mudanca_abs <- agg_com_pib$overall.att - agg_sem_pib$overall.att
+mudanca_pct <- 100 * abs(mudanca_abs) / abs(agg_sem_pib$overall.att)
+
+cat("| Modelo      | ATT      | SE       | P-valor | Mudança |\n")
+cat("|-------------|----------|----------|---------|----------|\n")
+cat(sprintf("| Sem PIB     | %+.6f | %.6f | %.4f   | --       |\n",
+            agg_sem_pib$overall.att,
+            agg_sem_pib$overall.se,
+            2 * pnorm(-abs(agg_sem_pib$overall.att / agg_sem_pib$overall.se))))
+cat(sprintf("| Com PIB     | %+.6f | %.6f | %.4f   | %+.1f%%  |\n",
+            agg_com_pib$overall.att,
+            agg_com_pib$overall.se,
+            2 * pnorm(-abs(agg_com_pib$overall.att / agg_com_pib$overall.se)),
+            mudanca_pct))
+cat("\n")
+
+# Interpretação
+if(mudanca_pct < 20) {
+  cat("✅ RESULTADO: Efeito é ROBUSTO (<20% mudança)\n")
+  cat("   Controlar PIB não altera substancialmente\n")
+  cat("   Dose-response não é confundimento por renda\n\n")
+} else if(mudanca_pct > 50) {
+  cat("⚠️ RESULTADO: Confundimento significativo (>50% mudança)\n")
+  cat("   PIB explica grande parte do efeito\n")
+  cat("   Use resultados COM PIB\n\n")
+} else {
+  cat("⚠️ RESULTADO: Mudança moderada (20-50%)\n")
+  cat("   PIB tem papel, mas efeito persiste\n\n")
+}
+
+# ============================================================================
+# EVENT STUDY
+# ============================================================================
+
+agg_com_pib_dynamic <- aggte(cs_com_pib, type = "dynamic")
+
+event_df <- tibble(
+  tempo = agg_com_pib_dynamic$egt,
+  att = agg_com_pib_dynamic$att.egt,
+  se = agg_com_pib_dynamic$se.egt
+) %>%
+  mutate(
+    p_valor = 2 * pnorm(-abs(att / se)),
+    sig = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01 ~ "**",
+      p_valor < 0.05 ~ "*",
+      p_valor < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  )
+
+# Pré-tendências
+pre_trends <- event_df %>% filter(tempo < 0)
+n_sig <- sum(pre_trends$p_valor < 0.05, na.rm = TRUE)
+pct_violacao <- 100 * n_sig / nrow(pre_trends)
+
+cat(sprintf("Pré-tendências violadas: %d/%d (%.1f%%)\n\n",
+            n_sig, nrow(pre_trends), pct_violacao))
+
+cat("Efeitos dinâmicos:\n")
+for(i in 1:nrow(event_df)) {
+  cat(sprintf("  t=%+3d: %+.6f (p=%.4f) %s\n",
+              event_df$tempo[i],
+              event_df$att[i],
+              event_df$p_valor[i],
+              event_df$sig[i]))
+}
+cat("\n")
+
+# Gráfico
+library(ggplot2)
+
+p_event <- ggdid(agg_com_pib_dynamic) +
+  labs(
+    title = "Event Study: Dose-Response com Controle de PIB",
+    subtitle = sprintf("Pré-tendências: %.1f%% | Mudança vs sem PIB: %.1f%%", 
+                       pct_violacao, mudanca_pct),
+    x = "Períodos relativos ao tratamento",
+    y = "ATT"
+  ) +
+  theme_minimal()
+
+ggsave("event_study_com_PIB.png", p_event, width = 10, height = 6, dpi = 300)
+
+cat("✅ Gráfico salvo: event_study_com_PIB.png\n\n")
+
+# ============================================================================
+# RESUMO FINAL
+# ============================================================================
+
+cat("ACHADOS PRINCIPAIS:\n\n")
+cat(sprintf("1. ATT sem PIB: %+.6f (p=%.4f)\n",
+            agg_sem_pib$overall.att,
+            2 * pnorm(-abs(agg_sem_pib$overall.att / agg_sem_pib$overall.se))))
+cat(sprintf("2. ATT com PIB: %+.6f (p=%.4f)\n",
+            agg_com_pib$overall.att,
+            2 * pnorm(-abs(agg_com_pib$overall.att / agg_com_pib$overall.se))))
+cat(sprintf("3. Mudança: %.1f%%\n", mudanca_pct))
+cat(sprintf("4. Pré-tendências: %.1f%% violadas\n", pct_violacao))
+cat(sprintf("5. Cobertura PIB: %.1f%%\n\n", pct_cobertura))
+
+```
+
+# CONVERTER IBGE → TSE
+
+```{r}
+# Carregar tabela de-para
+depara <- read_csv("depara-ibge-tse.csv")
+  
+# Padronizar nomes
+depara <- depara %>%
+  rename(
+    codigo_ibge = CD_MUNICIPIO_IBGE,
+    codigo_tse = CD_MUNICIPIO_TSE
+  )
+  
+cat(sprintf("✅ Tabela de-para: %d correspondências\n\n", nrow(depara)))
+```
+
+```{r}
+# Merge PIB + de-para
+pib_com_tse <- pib_total %>%
+  left_join(depara %>% select(CD_MUNICIPIO_IBGE, CD_MUNICIPIO_TSE), by = "Município(Código")
+  
+# Verificar match
+n_sem_tse <- sum(is.na(pib_com_tse$CD_MUNICIPIO_TSE))
+pct_match <- 100 * (1 - n_sem_tse / nrow(pib_com_tse))
+  
+cat(sprintf("Match IBGE→TSE: %.1f%%\n", pct_match))
+```
+
+
+# 1. Criar ID numérico
+
+```{r mapeamento_código_tse}
+# Mapeamento codigo_tse → id numérico
+mapeamento_id <- dados %>%
+  distinct(codigo_tse) %>%
+  arrange(codigo_tse) %>%
+  mutate(id = row_number())
+
+dados <- dados %>%
+  left_join(mapeamento_id, by = "codigo_tse")
+```
+
+# 2. Identificar primeiro ano com 4G
+
+```{r identify_cohort}
+dados <- dados %>%
+  group_by(id) %>%
+  arrange(id, ano) %>%
+  mutate(
+    # Primeiro ano em que tem_4g == 1 (dados TSE!)
+    primeiro_ano_4g = ifelse(any(tem_4g == 1), 
+                             min(ano[tem_4g == 1]), 
+                             0),
+    
+    # Gname: 0 para never-treated, ano para treated
+    gname = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g)
+  ) %>%
+  ungroup()
+head(dados)
+```
+
+# 3. Distribuição de cohorts
+
+```{r cohort_dist}
+# Verificar Distribuição de cohorts
+cohort_dist <- dados %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  arrange(gname)
+
+print(cohort_dist)
+cat("\n")
+
+# Verificar se faz sentido
+n_never <- cohort_dist$n[cohort_dist$gname == 0]
+n_treated <- sum(cohort_dist$n[cohort_dist$gname > 0])
+
+cat("📋 RESUMO:\n")
+cat(sprintf("   Never-treated: %d municípios (%.1f%%)\n", 
+            n_never, 100 * n_never / (n_never + n_treated)))
+cat(sprintf("   Treated: %d municípios (%.1f%%)\n", 
+            n_treated, 100 * n_treated / (n_never + n_treated)))
+cat("\n")
+
+# Checar se distribuição faz sentido
+if(n_never > n_treated * 0.5) {
+  cat("⚠️ ATENÇÃO: Muitos never-treated. Considere usar control='nevertreated'\n\n")
+}
+```
+
+# 4. Criar variável de intensidade CONDICIONAL ao tratamento
+
+```{r conditional_intensity}
+# Para cada município tratado, pegar intensidade NO ANO em que recebeu 4G
+dados <- dados %>%
+  group_by(id) %>%
+  mutate(
+    # Intensidade no ano de adoção (ou NA se never-treated)
+    intensidade_adocao = case_when(
+      gname > 0 & ano == gname ~ erbs_per_1000hab,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Propagar para todos os anos do município
+  fill(intensidade_adocao, .direction = "downup") %>%
+  ungroup()
+
+# Para never-treated, setar intensidade = 0
+dados <- dados %>%
+  mutate(
+    intensidade_adocao = ifelse(is.na(intensidade_adocao), 0, intensidade_adocao)
+  )
+
+intensidade_cohort <- dados %>%
+  filter(gname > 0, ano == gname) %>%
+  group_by(gname) %>%
+  summarise(
+    n = n(),
+    media_erbs = mean(erbs_per_1000hab, na.rm = TRUE),
+    mediana_erbs = median(erbs_per_1000hab, na.rm = TRUE),
+    sd_erbs = sd(erbs_per_1000hab, na.rm = TRUE),
+    min_erbs = min(erbs_per_1000hab, na.rm = TRUE),
+    max_erbs = max(erbs_per_1000hab, na.rm = TRUE)
+  )
+
+print(intensidade_cohort)
+cat("\n")
+
+# Verificar se há variação
+variacao_total <- sd(dados$intensidade_adocao[dados$gname > 0], na.rm = TRUE)
+cat(sprintf("Desvio-padrão de intensidade (todos tratados): %.4f\n", variacao_total))
+
+if(variacao_total < 0.01) {
+  cat("⚠️ ATENÇÃO: Pouca variação em intensidade! Dose-response pode não funcionar.\n")
+}
+```
+
+
+# 5. MODELO DOSE-RESPONSE STAGGERED: Intensidade como covariada
+
+```{r cs_dose_staggered}
+
+cat("Especificação:\n")
+cat("  Outcome: esteban_ray\n")
+cat("  Treatment timing: gname (baseado em tem_4g)\n")
+cat("  Dose: erbs_per_1000hab\n")
+cat("  Controles: anos_3g\n")
+cat("  Control group: notyettreated\n\n")
+
+# Estimar
+cs_dose <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id",
+  gname = "gname",
+  
+  # DOSE-RESPONSE
+  xformla = ~ anos_3g + erbs_per_1000hab,
+  
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",
+  base_period = "universal",
+  anticipation = 0,
+  print_details = FALSE
+)
+
+cat("✅ Estimação concluída!\n\n")
+
+# Agregação simples
+agg_dose <- aggte(cs_dose, type = "simple")
+
+cat("RESULTADO - ATT MÉDIO:\n")
+cat(sprintf("  ATT: %+.6f\n", agg_dose$overall.att))
+cat(sprintf("  SE:  %.6f\n", agg_dose$overall.se))
+cat(sprintf("  P-valor: %.4f\n", 
+            2 * pnorm(-abs(agg_dose$overall.att / agg_dose$overall.se))))
+
+baseline <- mean(dados$esteban_ray[dados$ano == 2010], na.rm = TRUE)
+efeito_pct <- (agg_dose$overall.att / baseline) * 100
+cat(sprintf("  Efeito: %.2f%% do baseline\n", efeito_pct))
+cat("\n")
+
+# Event study
+cat("Calculando event study...\n")
+agg_dose_dynamic <- aggte(cs_dose, type = "dynamic")
+
+# Análise pré-tendências
+event_df <- tibble(
+  tempo = agg_dose_dynamic$egt,
+  att = agg_dose_dynamic$att.egt,
+  se = agg_dose_dynamic$se.egt
+) %>%
+  mutate(
+    p_valor = 2 * pnorm(-abs(att / se)),
+    sig = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01 ~ "**",
+      p_valor < 0.05 ~ "*",
+      p_valor < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  )
+
+pre_trends <- event_df %>% filter(tempo < 0)
+n_sig <- sum(pre_trends$p_valor < 0.05, na.rm = TRUE)
+pct_violacao <- 100 * n_sig / nrow(pre_trends)
+
+cat(sprintf("\nPré-tendências violadas: %d/%d (%.1f%%)\n\n",
+            n_sig, nrow(pre_trends), pct_violacao))
+
+# Mostrar efeitos
+cat("Efeitos dinâmicos:\n")
+for(i in 1:nrow(event_df)) {
+  cat(sprintf("  t=%+3d: %+.6f (p=%.4f) %s\n",
+              event_df$tempo[i],
+              event_df$att[i],
+              event_df$p_valor[i],
+              event_df$sig[i]))
+}
+
+```
+
+# 6. MODELO 2: BINÁRIO (sem dose-response)
+
+```{r staggered_binario}
+cs_binario <- att_gt(
+  yname = "esteban_ray",
+  tname = "ano",
+  idname = "id",
+  gname = "gname",
+  xformla = ~ anos_3g,  # SEM dose
+  data = dados,
+  control_group = "notyettreated",
+  est_method = "reg",
+  print_details = FALSE
+)
+
+agg_binario <- aggte(cs_binario, type = "simple")
+
+cat("RESULTADO:\n")
+cat(sprintf("  ATT: %+.6f\n", agg_binario$overall.att))
+cat(sprintf("  SE:  %.6f\n", agg_binario$overall.se))
+cat(sprintf("  P-valor: %.4f\n", 
+            2 * pnorm(-abs(agg_binario$overall.att / agg_binario$overall.se))))
+```
+
+# 7. Comparacao entre modelos
+
+```{r model_comparision}
+cat("| Modelo           | ATT      | SE       | P-valor | Efeito % |\n")
+cat("|------------------|----------|----------|---------|----------|\n")
+cat(sprintf("| Binário          | %+.6f | %.6f | %.4f   | %+.2f%%  |\n",
+            agg_binario$overall.att,
+            agg_binario$overall.se,
+            2 * pnorm(-abs(agg_binario$overall.att / agg_binario$overall.se)),
+            100 * agg_binario$overall.att / baseline))
+cat(sprintf("| Dose-Response    | %+.6f | %.6f | %.4f   | %+.2f%%  |\n",
+            agg_dose$overall.att,
+            agg_dose$overall.se,
+            2 * pnorm(-abs(agg_dose$overall.att / agg_dose$overall.se)),
+            efeito_pct))
+cat("\n")
+
+# Diferença
+diff_att <- abs(agg_dose$overall.att) - abs(agg_binario$overall.att)
+if(abs(diff_att) < 0.0001) {
+  cat("➡️ Modelos praticamente IDÊNTICOS\n")
+  cat("   Intensidade NÃO parece importar (apenas acesso 0 vs 1)\n\n")
+} else if(abs(agg_dose$overall.att) > abs(agg_binario$overall.att)) {
+  cat("➡️ Dose-response captura efeito MAIOR\n")
+  cat("   Intensidade IMPORTA!\n\n")
+} else {
+  cat("➡️ Dose-response captura efeito MENOR\n")
+  cat("   Controlar por intensidade atenua o efeito\n\n")
+}
+```
+
+# Gráficos
+
+```{r plots}
+library(ggplot2)
+
+cat("Gerando gráficos...\n")
+
+# Event study
+p_event <- ggdid(agg_dose_dynamic) +
+  labs(
+    title = "Event Study: Dose-Response Staggered DiD",
+    subtitle = sprintf("Pré-tendências violadas: %.1f%% | ATT médio: %.4f", 
+                       pct_violacao, agg_dose$overall.att),
+    x = "Períodos relativos ao tratamento",
+    y = "ATT (Esteban-Ray)"
+  ) +
+  theme_minimal()
+
+ggsave("event_study_dose_staggered.png", p_event, width = 10, height = 6, dpi = 300)
+
+cat("✅ Gráfico salvo: event_study_dose_staggered.png\n\n")
+
+```
+
+# Análise quartis
+
+```{r quartis}
+
+# Quartis (apenas tratados)
+quartis <- quantile(dados$intensidade_adocao[dados$gname > 0], 
+                    probs = c(0, 0.25, 0.5, 0.75, 1),
+                    na.rm = TRUE)
+
+cat("Quartis de intensidade:\n")
+print(quartis)
+cat("\n")
+
+dados <- dados %>%
+  mutate(
+    quartil = case_when(
+      gname == 0 ~ "Never",
+      intensidade_adocao <= quartis[2] ~ "Q1",
+      intensidade_adocao <= quartis[3] ~ "Q2",
+      intensidade_adocao <= quartis[4] ~ "Q3",
+      TRUE ~ "Q4"
+    )
+  )
+
+# Estimar por quartil
+resultados_q <- list()
+
+for(q in c("Q1", "Q2", "Q3", "Q4")) {
+  cat(sprintf("Estimando %s...\n", q))
+  
+  dados_q <- dados %>% filter(quartil %in% c(q, "Never"))
+  
+  tryCatch({
+    cs_q <- att_gt(
+      yname = "esteban_ray",
+      tname = "ano",
+      idname = "id",
+      gname = "gname",
+      xformla = ~ anos_3g,
+      data = dados_q,
+      control_group = "notyettreated",
+      est_method = "reg",
+      print_details = FALSE
+    )
+    
+    agg_q <- aggte(cs_q, type = "simple")
+    
+    resultados_q[[q]] <- tibble(
+      quartil = q,
+      att = agg_q$overall.att,
+      se = agg_q$overall.se,
+      p = 2 * pnorm(-abs(att / se)),
+      n = n_distinct(dados_q$id[dados_q$gname > 0]),
+      intensidade_media = mean(dados_q$intensidade_adocao[dados_q$gname > 0])
+    )
+    
+  }, error = function(e) {
+    cat(sprintf("  ⚠️ Erro: %s\n", e$message))
+  })
+}
+
+if(length(resultados_q) > 0) {
+  df_quartis <- bind_rows(resultados_q)
+  
+  cat("\n📊 RESULTADOS POR QUARTIL:\n\n")
+  print(df_quartis)
+  cat("\n")
+  
+  # Testar linearidade
+  if(nrow(df_quartis) == 4) {
+    cor_quartil_att <- cor(1:4, df_quartis$att)
+    cat(sprintf("Correlação quartil × ATT: %.3f\n", cor_quartil_att))
+    
+    if(abs(cor_quartil_att) > 0.7) {
+      cat("➡️ Forte relação linear: dose-response detectado!\n")
+    } else if(abs(cor_quartil_att) > 0.3) {
+      cat("➡️ Relação moderada: algum dose-response\n")
+    } else {
+      cat("➡️ Relação fraca: dose-response limitado ou não-linear\n")
+    }
+    cat("\n")
+  }
+  
+  # Gráfico
+  p_q <- ggplot(df_quartis, aes(x = quartil, y = att)) +
+    geom_point(size = 4) +
+    geom_errorbar(aes(ymin = att - 1.96*se, ymax = att + 1.96*se), 
+                  width = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    geom_line(aes(group = 1), linetype = "dotted", alpha = 0.5) +
+    labs(
+      title = "Efeito por Quartil de Intensidade",
+      subtitle = "ATT com IC 95%",
+      x = "Quartil de Intensidade (ERBs/1000hab)",
+      y = "ATT"
+    ) +
+    theme_minimal()
+  
+  ggsave("heterogeneidade_quartis.png", p_q, width = 8, height = 6, dpi = 300)
+  cat("✅ Gráfico salvo: heterogeneidade_quartis.png\n\n")
+}
+```
+
+# Resumo
+
+```{r results_summary}
+cat("ACHADOS PRINCIPAIS:\n\n")
+cat(sprintf("1. ATT médio (dose-response): %+.6f (p=%.4f)\n",
+            agg_dose$overall.att,
+            2 * pnorm(-abs(agg_dose$overall.att / agg_dose$overall.se))))
+cat(sprintf("2. ATT médio (binário): %+.6f (p=%.4f)\n",
+            agg_binario$overall.att,
+            2 * pnorm(-abs(agg_binario$overall.att / agg_binario$overall.se))))
+cat(sprintf("3. Pré-tendências violadas: %.1f%%\n", pct_violacao))
+cat(sprintf("4. Cohorts identificados: %d\n", sum(cohort_dist$n[cohort_dist$gname > 0])))
+cat(sprintf("5. Never-treated: %d municípios\n", n_never))
+cat("\n")
+
+if(pct_violacao > 30) {
+  cat("⚠️ ATENÇÃO: Violação severa de parallel trends\n")
+  cat("   Identificação causal comprometida\n")
+  cat("   Considere adicionar mais controles\n\n")
+}
+
+if(agg_dose$overall.att < 0) {
+  cat("⚠️ Efeito NEGATIVO (contra-intuitivo)\n")
+  cat("   Possíveis explicações:\n")
+  cat("   - Seleção endógena\n")
+  cat("   - Confundimento não observado\n")
+  cat("   - 4G facilita acesso a informação diversa\n\n")
+}
+
+cat("📁 ARQUIVOS GERADOS:\n")
+cat("   - event_study_dose_staggered.png\n")
+cat("   - heterogeneidade_quartis.png\n\n")
+
+cat("============================================\n")
+```
+

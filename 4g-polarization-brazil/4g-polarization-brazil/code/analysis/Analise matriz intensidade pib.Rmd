@@ -1,0 +1,605 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(did)
+library(fixest)
+library(stats)
+library(ggplot2)
+library(gridExtra)
+```
+
+
+# ============================================================================
+# ANÁLISE MATRIZ: INTENSIDADE 4G × PIB PER CAPITA
+# Dose-response por combinação de infraestrutura e renda
+# ============================================================================
+
+# CARREGAR DADOS
+
+```{r load_data}
+if(file.exists("painel_com_intensidade_4g_e_PIB.csv")) {
+  dados <- read_csv("painel_com_intensidade_4g_e_PIB.csv",
+                    col_types = cols(codigo_tse = col_character()))
+  cat("✅ Painel carregado\n\n")
+} else {
+  cat("❌ Arquivo não encontrado!\n")
+  stop()
+}
+
+# Verificar variáveis necessárias
+vars_necessarias <- c("esteban_ray", "tem_4g", "anos_3g", "erbs_per_1000hab",
+                      "pib_per_capita", "log_pib_pc", "codigo_tse", "ano")
+
+missing <- setdiff(vars_necessarias, names(dados))
+if(length(missing) > 0) {
+  cat("❌ Variáveis faltando:", paste(missing, collapse=", "), "\n")
+  stop()
+}
+
+cat(sprintf("Dados: %d linhas, %d municípios\n", 
+            nrow(dados), n_distinct(dados$codigo_tse)))
+cat(sprintf("Anos: %s\n\n", paste(unique(dados$ano), collapse=", ")))
+
+```
+
+# CRIAR ID E GNAME
+
+```{r id_gname}
+if(!"id" %in% names(dados)) {
+  cat("📊 Criando ID...\n")
+  mapeamento_id <- dados %>%
+    distinct(codigo_tse) %>%
+    arrange(codigo_tse) %>%
+    mutate(id = row_number())
+  
+  dados <- dados %>% left_join(mapeamento_id, by = "codigo_tse")
+}
+
+if(!"gname" %in% names(dados)) {
+  cat("📊 Criando gname...\n")
+  dados <- dados %>%
+    group_by(id) %>%
+    arrange(id, ano) %>%
+    mutate(
+      primeiro_ano_4g = ifelse(any(tem_4g == 1), min(ano[tem_4g == 1]), 0),
+      gname = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g)
+    ) %>%
+    ungroup()
+}
+
+cat("✅ ID e gname prontos\n\n")
+```
+
+# CRIAR QUARTIS DE INTENSIDADE E PIB
+
+```{r quartis_intensidade_PIB}
+# Quartis de PIB (por ano)
+dados <- dados %>%
+  group_by(ano) %>%
+  mutate(
+    quartil_pib = ntile(pib_per_capita, 4),
+    quartil_pib_label = case_when(
+      quartil_pib == 1 ~ "Q1_PIB",
+      quartil_pib == 2 ~ "Q2_PIB",
+      quartil_pib == 3 ~ "Q3_PIB",
+      quartil_pib == 4 ~ "Q4_PIB"
+    )
+  ) %>%
+  ungroup()
+
+# Quartis de Intensidade 4G
+# IMPORTANTE: Calcular apenas para municípios COM 4G
+# Para municípios SEM 4G, categoria = "Sem_4G"
+
+dados <- dados %>%
+  mutate(
+    # Criar flag para municípios que NUNCA tiveram 4G
+    nunca_teve_4g = (gname == 0)
+  )
+
+# Quartis apenas entre municípios que têm 4G
+dados_com_4g <- dados %>%
+  filter(!nunca_teve_4g, erbs_per_1000hab > 0)
+
+# Calcular quartis globalmente (não por ano)
+# Razão: queremos classificação consistente da intensidade
+quartis_intensidade <- quantile(dados_com_4g$erbs_per_1000hab, 
+                                probs = c(0, 0.25, 0.5, 0.75, 1), 
+                                na.rm = TRUE)
+
+cat("Limites dos quartis de intensidade 4G:\n")
+print(quartis_intensidade)
+cat("\n")
+
+# Atribuir quartis
+dados <- dados %>%
+  mutate(
+    quartil_intensidade = case_when(
+      nunca_teve_4g ~ 0,
+      erbs_per_1000hab <= quartis_intensidade[2] ~ 1,
+      erbs_per_1000hab <= quartis_intensidade[3] ~ 2,
+      erbs_per_1000hab <= quartis_intensidade[4] ~ 3,
+      TRUE ~ 4
+    ),
+    quartil_intensidade_label = case_when(
+      quartil_intensidade == 0 ~ "Sem_4G",
+      quartil_intensidade == 1 ~ "Q1_Int",
+      quartil_intensidade == 2 ~ "Q2_Int",
+      quartil_intensidade == 3 ~ "Q3_Int",
+      quartil_intensidade == 4 ~ "Q4_Int"
+    )
+  )
+
+cat("✅ Quartis criados\n\n")
+
+# Distribuição
+cat("Distribuição de municípios por quartil de intensidade (2022):\n")
+dist_int <- dados %>%
+  filter(ano == 2022) %>%
+  count(quartil_intensidade_label) %>%
+  arrange(quartil_intensidade_label)
+print(dist_int)
+cat("\n")
+
+cat("Distribuição de municípios por quartil de PIB (2022):\n")
+dist_pib <- dados %>%
+  filter(ano == 2022) %>%
+  count(quartil_pib_label) %>%
+  arrange(quartil_pib_label)
+print(dist_pib)
+```
+
+# CRIAR CÉLULAS DA MATRIZ
+
+```{r celulas_quartis}
+# Combinar quartis
+dados <- dados %>%
+  mutate(
+    celula = paste0(quartil_intensidade_label, "_", quartil_pib_label),
+    celula_label = paste0(quartil_intensidade_label, " × ", quartil_pib_label)
+  )
+
+# Contar observações por célula
+cat("Distribuição de municípios por célula (2022):\n\n")
+matriz_n <- dados %>%
+  filter(ano == 2022) %>%
+  count(quartil_intensidade_label, quartil_pib_label) %>%
+  pivot_wider(
+    names_from = quartil_pib_label,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  arrange(quartil_intensidade_label)
+
+print(matriz_n)
+cat("\n")
+
+# Identificar células com N suficiente
+# Critério: N >= 100 municípios (400 obs com 4 anos)
+celulas_validas <- dados %>%
+  filter(ano == 2022) %>%
+  count(celula, celula_label, quartil_intensidade, quartil_pib) %>%
+  filter(n >= 100) %>%
+  arrange(quartil_intensidade, quartil_pib)
+
+cat(sprintf("Células com N >= 100: %d de 20 possíveis\n\n", nrow(celulas_validas)))
+
+if(nrow(celulas_validas) > 0) {
+  cat("Células válidas:\n")
+  print(celulas_validas %>% select(celula_label, n))
+  cat("\n")
+}
+```
+
+# FUNÇÃO PARA RODAR CS POR CÉLULA
+
+```{r cs_cell_estimation_function}
+rodar_cs_celula <- function(dados_celula, nome_celula) {
+  
+  cat(sprintf("\n--- Processando %s ---\n", nome_celula))
+  
+  # Verificar tamanho
+  n_mun <- n_distinct(dados_celula$codigo_tse)
+  n_tratados <- n_distinct(dados_celula$codigo_tse[dados_celula$gname > 0])
+  
+  cat(sprintf("  Municípios: %d | Tratados: %d (%.1f%%)\n", 
+              n_mun, n_tratados, 100*n_tratados/n_mun))
+  
+  # Verificar cohorts
+  cohorts <- dados_celula %>%
+    distinct(id, gname) %>%
+    count(gname)
+  
+  cat("  Cohorts:\n")
+  for(i in 1:nrow(cohorts)) {
+    cat(sprintf("    gname=%d: %d\n", cohorts$gname[i], cohorts$n[i]))
+  }
+  
+  # Avisos
+  if(n_tratados < 50) {
+    cat("  ⚠️ ATENÇÃO: Poucos tratados (<50)\n")
+  }
+  
+  if(n_mun < 100) {
+    cat("  ⚠️ ATENÇÃO: Poucos municípios (<100)\n")
+  }
+  
+  # Verificar se há never-treated
+  n_never <- sum(cohorts$gname == 0)
+  if(n_never == 0) {
+    cat("  ⚠️ SEM never-treated, usando not-yet-treated\n")
+  }
+  
+  # Estimar
+  tryCatch({
+    
+    cs_result <- att_gt(
+      yname = "esteban_ray",
+      tname = "ano",
+      idname = "id",
+      gname = "gname",
+      xformla = ~ anos_3g + erbs_per_1000hab + log_pib_pc,
+      data = dados_celula,
+      control_group = "notyettreated",
+      est_method = "reg",
+      base_period = "universal",
+      anticipation = 0,
+      print_details = FALSE
+    )
+    
+    agg_simple <- aggte(cs_result, type = "simple")
+    agg_dynamic <- aggte(cs_result, type = "dynamic")
+    
+    list(
+      nome = nome_celula,
+      cs = cs_result,
+      agg_simple = agg_simple,
+      agg_dynamic = agg_dynamic,
+      n_mun = n_mun,
+      n_tratados = n_tratados,
+      sucesso = TRUE
+    )
+    
+  }, error = function(e) {
+    cat("  ❌ ERRO:\n")
+    cat(sprintf("     %s\n", e$message))
+    
+    list(
+      nome = nome_celula,
+      sucesso = FALSE,
+      erro = e$message
+    )
+  })
+}
+```
+
+# RODAR ANÁLISE PARA CÉLULAS SELECIONADAS
+
+```{r analise_estimation}
+# ESTRATÉGIA: Rodar apenas células com N >= 100
+# E focar nas mais interessantes teoricamente
+
+# Células prioritárias (hipóteses a priori):
+# 1. Q4_Int × Q4_PIB (Alta × Alta) - esperamos maior efeito negativo
+# 2. Q1_Int × Q1_PIB (Baixa × Baixa) - esperamos efeito positivo ou nulo
+# 3. Q3_Int × Q3_PIB (Média × Média) - sweet spot?
+# 4. Diagonal completa + algumas off-diagonal
+
+# Identificar células para rodar
+celulas_rodar <- celulas_validas %>%
+  filter(
+    # Diagonal
+    (quartil_intensidade == quartil_pib) |
+    # Off-diagonal interessantes
+    (quartil_intensidade == 4 & quartil_pib %in% c(3, 4)) |
+    (quartil_intensidade == 3 & quartil_pib %in% c(2, 3, 4)) |
+    (quartil_intensidade == 1 & quartil_pib %in% c(1, 2))
+  )
+
+cat(sprintf("Rodando CS para %d células:\n\n", nrow(celulas_rodar)))
+
+resultados_celulas <- list()
+
+for(i in 1:nrow(celulas_rodar)) {
+  
+  celula_atual <- celulas_rodar$celula[i]
+  label_atual <- celulas_rodar$celula_label[i]
+  
+  # Filtrar dados
+  dados_celula <- dados %>% filter(celula == celula_atual)
+  
+  # Rodar CS
+  resultado <- rodar_cs_celula(dados_celula, label_atual)
+  
+  # Guardar
+  resultados_celulas[[celula_atual]] <- resultado
+}
+```
+
+# TABELA DE RESULTADOS
+
+```{r results_table}
+# Criar tabela
+tabela_matriz <- tibble(
+  Celula = character(),
+  Quartil_Int = integer(),
+  Quartil_PIB = integer(),
+  N_Tratados = integer(),
+  ATT = numeric(),
+  SE = numeric(),
+  P_valor = numeric(),
+  IC_lower = numeric(),
+  IC_upper = numeric(),
+  Sig = character()
+)
+
+for(celula_nome in names(resultados_celulas)) {
+  res <- resultados_celulas[[celula_nome]]
+  
+  if(res$sucesso) {
+    att <- res$agg_simple$overall.att
+    se <- res$agg_simple$overall.se
+    p_val <- 2 * pnorm(-abs(att / se))
+    
+    ic_lower <- att - 1.96 * se
+    ic_upper <- att + 1.96 * se
+    
+    sig <- case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      p_val < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+    
+    # Extrair quartis do nome
+    parts <- str_split(celula_nome, "_")[[1]]
+    q_int <- as.integer(str_remove(parts[1], "Q"))
+    q_pib <- as.integer(str_remove(parts[3], "Q"))
+    
+    if(is.na(q_int)) q_int <- 0  # Sem_4G
+    
+    tabela_matriz <- tabela_matriz %>%
+      add_row(
+        Celula = res$nome,
+        Quartil_Int = q_int,
+        Quartil_PIB = q_pib,
+        N_Tratados = res$n_tratados,
+        ATT = att,
+        SE = se,
+        P_valor = p_val,
+        IC_lower = ic_lower,
+        IC_upper = ic_upper,
+        Sig = sig
+      )
+  }
+}
+
+# Ordenar
+tabela_matriz <- tabela_matriz %>%
+  arrange(Quartil_Int, Quartil_PIB)
+
+print(tabela_matriz, n = 100)
+cat("\n")
+
+# Formatação para paper
+cat("FORMATAÇÃO PARA PAPER:\n")
+cat(paste(rep("-", 100), collapse=""), "\n")
+cat("| Célula                   | N    | ATT        | SE        | P-valor | IC 95%                  | Sig |\n")
+cat("|--------------------------|------|------------|-----------|---------|-------------------------|-----|\n")
+
+for(i in 1:nrow(tabela_matriz)) {
+  row <- tabela_matriz[i,]
+  
+  cat(sprintf("| %-24s | %4d | %+.6f | %.6f | %.4f  | [%+.6f, %+.6f] | %-3s |\n",
+              row$Celula,
+              row$N_Tratados,
+              row$ATT,
+              row$SE,
+              row$P_valor,
+              row$IC_lower,
+              row$IC_upper,
+              row$Sig))
+}
+```
+
+# VISUALIZAÇÃO: HEATMAP DA MATRIZ
+
+```{r heatmap_matriz}
+# Preparar dados para heatmap
+# Criar matriz completa 4×4 (sem Sem_4G)
+heatmap_data <- tabela_matriz %>%
+  filter(Quartil_Int > 0) %>%  # Remover Sem_4G
+  select(Quartil_Int, Quartil_PIB, ATT, P_valor) %>%
+  mutate(
+    significativo = P_valor < 0.05,
+    label_att = sprintf("%.4f%s", ATT, ifelse(significativo, "*", ""))
+  )
+
+# Criar matriz completa com NAs para células não estimadas
+matriz_completa <- expand_grid(
+  Quartil_Int = 1:4,
+  Quartil_PIB = 1:4
+) %>%
+  left_join(heatmap_data, by = c("Quartil_Int", "Quartil_PIB"))
+
+# Heatmap
+p_heatmap <- ggplot(matriz_completa, 
+                    aes(x = factor(Quartil_PIB), 
+                        y = factor(Quartil_Int, levels = 4:1),
+                        fill = ATT)) +
+  geom_tile(color = "white", size = 1) +
+  geom_text(aes(label = label_att), 
+            size = 4, 
+            fontface = "bold",
+            na.rm = TRUE) +
+  scale_fill_gradient2(
+    low = "steelblue",
+    mid = "white",
+    high = "coral",
+    midpoint = 0,
+    na.value = "gray90",
+    name = "ATT"
+  ) +
+  labs(
+    title = "Efeito Dose-Response por Intensidade 4G × PIB Per Capita",
+    subtitle = "Cells show ATT | * indicates p<0.05 | Gray = not estimated",
+    x = "Quartil de PIB Per Capita →",
+    y = "← Quartil de Intensidade 4G"
+  ) +
+  scale_x_discrete(labels = c("Q1\nBaixo", "Q2\nMédio-\nBaixo", 
+                               "Q3\nMédio-\nAlto", "Q4\nAlto")) +
+  scale_y_discrete(labels = c("Q4\nAlta", "Q3\nMédia-\nAlta", 
+                               "Q2\nMédia-\nBaixa", "Q1\nBaixa")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+ggsave("heatmap_intensidade_pib.png", 
+       p_heatmap, 
+       width = 10, 
+       height = 8, 
+       dpi = 300)
+
+cat("✅ Heatmap salvo: heatmap_intensidade_pib.png\n\n")
+```
+
+# ANÁLISE DE PADRÕES
+
+```{r analise_padroes}
+# Diagonal vs Off-diagonal
+diagonal <- tabela_matriz %>%
+  filter(Quartil_Int == Quartil_PIB, Quartil_Int > 0)
+
+off_diagonal <- tabela_matriz %>%
+  filter(Quartil_Int != Quartil_PIB, Quartil_Int > 0)
+
+if(nrow(diagonal) >= 2) {
+  cat("DIAGONAL (Int = PIB):\n")
+  cat(sprintf("  N células: %d\n", nrow(diagonal)))
+  cat(sprintf("  ATT médio: %.6f\n", mean(diagonal$ATT, na.rm = TRUE)))
+  cat(sprintf("  ATT mediano: %.6f\n\n", median(diagonal$ATT, na.rm = TRUE)))
+  
+  # Correlação diagonal
+  if(nrow(diagonal) >= 3) {
+    cor_diag <- cor(diagonal$Quartil_Int, diagonal$ATT)
+    cat(sprintf("  Correlação (Quartil × ATT) na diagonal: %.3f\n\n", cor_diag))
+  }
+}
+
+if(nrow(off_diagonal) > 0) {
+  cat("OFF-DIAGONAL (Int ≠ PIB):\n")
+  cat(sprintf("  N células: %d\n", nrow(off_diagonal)))
+  cat(sprintf("  ATT médio: %.6f\n", mean(off_diagonal$ATT, na.rm = TRUE)))
+  cat(sprintf("  ATT mediano: %.6f\n\n", median(off_diagonal$ATT, na.rm = TRUE)))
+}
+
+# Identificar célula com maior efeito (em módulo)
+maior_efeito <- tabela_matriz %>%
+  filter(!is.na(ATT)) %>%
+  filter(abs(ATT) == max(abs(ATT)))
+
+cat("CÉLULA COM MAIOR EFEITO (magnitude):\n")
+cat(sprintf("  %s\n", maior_efeito$Celula))
+cat(sprintf("  ATT: %.6f (p=%.4f)\n\n", maior_efeito$ATT, maior_efeito$P_valor))
+
+# Identificar células significativas
+sig_celulas <- tabela_matriz %>%
+  filter(P_valor < 0.05)
+
+cat(sprintf("CÉLULAS SIGNIFICATIVAS (p<0.05): %d\n", nrow(sig_celulas)))
+if(nrow(sig_celulas) > 0) {
+  for(i in 1:nrow(sig_celulas)) {
+    cat(sprintf("  %s: ATT=%.6f (p=%.4f)\n",
+                sig_celulas$Celula[i],
+                sig_celulas$ATT[i],
+                sig_celulas$P_valor[i]))
+  }
+}
+```
+
+# EXPORTAR RESULTADOS
+
+```{r results_exporting}
+write_csv(tabela_matriz, "resultados_matriz_intensidade_pib.csv")
+cat("✅ Tabela salva: resultados_matriz_intensidade_pib.csv\n\n")
+```
+# RESUMO EXECUTIVO
+
+```{r summary}
+if(nrow(tabela_matriz) > 0) {
+  
+  # Padrão geral
+  cat("1. PADRÃO GERAL:\n")
+  
+  atts_validos <- tabela_matriz %>% filter(!is.na(ATT))
+  
+  if(nrow(atts_validos) >= 5) {
+    
+    # Teste se diagonal é diferente
+    if(nrow(diagonal) >= 2 && nrow(off_diagonal) >= 2) {
+      t_test <- t.test(diagonal$ATT, off_diagonal$ATT)
+      
+      cat(sprintf("   Diagonal vs Off-diagonal: p = %.4f\n", t_test$p.value))
+      
+      if(t_test$p.value < 0.05) {
+        cat("   ✅ Diagonal é SIGNIFICATIVAMENTE diferente\n")
+        cat("   → Interação Intensidade × PIB importa!\n\n")
+      } else {
+        cat("   ⚠️ Diagonal NÃO é significativamente diferente\n\n")
+      }
+    }
+    
+    # Identificar padrão
+    max_abs_att <- atts_validos %>% filter(abs(ATT) == max(abs(ATT)))
+    
+    cat(sprintf("2. CÉLULA MAIS FORTE: %s\n", max_abs_att$Celula))
+    cat(sprintf("   ATT: %.6f\n", max_abs_att$ATT))
+    cat(sprintf("   Significativo: %s\n\n", 
+                ifelse(max_abs_att$P_valor < 0.05, "SIM", "NÃO")))
+    
+    # Significância
+    n_sig <- sum(atts_validos$P_valor < 0.05)
+    pct_sig <- 100 * n_sig / nrow(atts_validos)
+    
+    cat(sprintf("3. SIGNIFICÂNCIA: %d/%d células (%.1f%%)\n\n", 
+                n_sig, nrow(atts_validos), pct_sig))
+  }
+}
+
+cat("ARQUIVOS GERADOS:\n")
+cat("  - heatmap_intensidade_pib.png\n")
+cat("  - resultados_matriz_intensidade_pib.csv\n")
+cat("\n")
+```
+

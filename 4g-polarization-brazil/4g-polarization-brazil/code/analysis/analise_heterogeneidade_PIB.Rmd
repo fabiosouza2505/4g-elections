@@ -1,0 +1,626 @@
+---
+title: "analise_heterogeneidade_PIB"
+author: "Fabio de Medeiros"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+# Packages
+
+```{r}
+library(tidyverse)
+library(did)
+library(fixest)
+library(stats)
+```
+
+# ============================================================================
+# HETEROGENEIDADE POR QUARTIS DE PIB
+# Análise dose-response separada por nível de renda municipal
+# ============================================================================
+
+# Carregando dados
+```{r load_data}
+if(file.exists("painel_com_intensidade_4g_e_PIB.csv")) {
+  dados <- read_csv("painel_com_intensidade_4g_e_PIB.csv",
+                    col_types = cols(codigo_tse = col_character()))
+  cat("✅ Painel com PIB carregado\n\n")
+} else {
+  cat("❌ Arquivo 'painel_com_intensidade_4g_e_PIB.csv' não encontrado!\n")
+  cat("   Execute primeiro: dose_response_com_PIB_TUDO_NO_R.R\n")
+  stop()
+}
+
+# Verificar variáveis base necessárias
+vars_base <- c("pib_per_capita", "log_pib_pc", "esteban_ray", 
+               "tem_4g", "anos_3g", "erbs_per_1000hab")
+
+missing_vars <- setdiff(vars_base, names(dados))
+
+if(length(missing_vars) > 0) {
+  cat("❌ Variáveis faltando:", paste(missing_vars, collapse=", "), "\n")
+  stop()
+}
+
+cat(sprintf("Painel: %d linhas, %d municípios\n", 
+            nrow(dados), n_distinct(dados$codigo_tse)))
+cat(sprintf("Anos: %s\n\n", paste(unique(dados$ano), collapse=", ")))
+```
+
+# CRIAR ID E GNAME
+
+```{r id_gname}
+
+if(!"id" %in% names(dados)) {
+  cat("📊 Criando ID numérico...\n")
+  
+  mapeamento_id <- dados %>%
+    distinct(codigo_tse) %>%
+    arrange(codigo_tse) %>%
+    mutate(id = row_number())
+  
+  dados <- dados %>%
+    left_join(mapeamento_id, by = "codigo_tse")
+  
+  cat("✅ ID criado\n")
+}
+
+if(!"gname" %in% names(dados)) {
+  cat("📊 Criando gname (cohort)...\n")
+  
+  dados <- dados %>%
+    group_by(id) %>%
+    arrange(id, ano) %>%
+    mutate(
+      primeiro_ano_4g = ifelse(any(tem_4g == 1), min(ano[tem_4g == 1]), 0),
+      gname = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g)
+    ) %>%
+    ungroup()
+  
+  cat("✅ gname criado\n")
+}
+
+cat("\n")
+cat("Distribuição de cohorts:\n")
+cohort_summary <- dados %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  arrange(gname)
+print(cohort_summary)
+
+```
+
+
+# CRIAR QUARTIS DE PIB
+
+```{r criar_quartis}
+
+# Calcular quartis por ano (PIB cresce no tempo)
+# Importante: usar quartis por ano, não globais!
+
+dados <- dados %>%
+  group_by(ano) %>%
+  mutate(
+    quartil_pib = ntile(pib_per_capita, 4),
+    # Labels descritivos
+    quartil_pib_label = case_when(
+      quartil_pib == 1 ~ "Q1 (Baixo PIB)",
+      quartil_pib == 2 ~ "Q2 (Médio-Baixo)",
+      quartil_pib == 3 ~ "Q3 (Médio-Alto)",
+      quartil_pib == 4 ~ "Q4 (Alto PIB)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup()
+
+cat("✅ Quartis criados\n\n")
+
+# Estatísticas dos quartis
+cat("Estatísticas PIB per capita por quartil (média geral):\n\n")
+
+stats_quartis <- dados %>%
+  group_by(quartil_pib, quartil_pib_label) %>%
+  summarise(
+    n_obs = n(),
+    n_municipios = n_distinct(codigo_tse),
+    pib_pc_medio = mean(pib_per_capita, na.rm = TRUE),
+    pib_pc_mediano = median(pib_per_capita, na.rm = TRUE),
+    pib_pc_min = min(pib_per_capita, na.rm = TRUE),
+    pib_pc_max = max(pib_per_capita, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(quartil_pib)
+
+print(stats_quartis)
+cat("\n")
+
+# Verificar distribuição de 4G por quartil
+cat("Distribuição de municípios com 4G por quartil (2022):\n\n")
+
+dist_4g <- dados %>%
+  filter(ano == 2022) %>%
+  group_by(quartil_pib_label) %>%
+  summarise(
+    total = n(),
+    com_4g = sum(tem_4g == 1, na.rm = TRUE),
+    pct_com_4g = 100 * com_4g / total,
+    .groups = 'drop'
+  )
+
+print(dist_4g)
+```
+
+# FUNÇÃO PARA RODAR CS POR QUARTIL
+
+```{r function_cs_quartil}
+
+rodar_cs_quartil <- function(dados_quartil, nome_quartil) {
+  
+  cat(sprintf("\n--- Processando %s ---\n", nome_quartil))
+  
+  # Verificar tamanho da amostra
+  n_mun <- n_distinct(dados_quartil$codigo_tse)
+  n_tratados <- n_distinct(dados_quartil$codigo_tse[dados_quartil$gname > 0])
+  
+  cat(sprintf("  Municípios: %d | Tratados: %d (%.1f%%)\n", 
+              n_mun, n_tratados, 100*n_tratados/n_mun))
+  
+  # Verificar distribuição de cohorts
+  cohorts <- dados_quartil %>%
+    distinct(id, gname) %>%
+    count(gname) %>%
+    arrange(gname)
+  
+  cat("  Cohorts:\n")
+  for(i in 1:nrow(cohorts)) {
+    cat(sprintf("    gname=%d: %d municípios\n", 
+                cohorts$gname[i], cohorts$n[i]))
+  }
+  
+  # Verificar se há variação suficiente
+  if(n_tratados < 50) {
+    cat("  ⚠️ ATENÇÃO: Poucos municípios tratados (<50)\n")
+    cat("     Resultados podem ser instáveis\n")
+  }
+  
+  # Estimar modelo
+  tryCatch({
+    
+    cs_result <- att_gt(
+      yname = "esteban_ray",
+      tname = "ano",
+      idname = "id",
+      gname = "gname",
+      xformla = ~ anos_3g + erbs_per_1000hab + log_pib_pc,
+      data = dados_quartil,
+      control_group = "notyettreated",
+      est_method = "reg",
+      base_period = "universal",
+      anticipation = 0,
+      print_details = FALSE
+    )
+    
+    # Agregar
+    agg_simple <- aggte(cs_result, type = "simple")
+    agg_dynamic <- aggte(cs_result, type = "dynamic")
+    
+    # Retornar resultados
+    list(
+      nome = nome_quartil,
+      cs = cs_result,
+      agg_simple = agg_simple,
+      agg_dynamic = agg_dynamic,
+      n_mun = n_mun,
+      n_tratados = n_tratados,
+      sucesso = TRUE
+    )
+    
+  }, error = function(e) {
+    cat("  ❌ ERRO ao estimar modelo:\n")
+    cat(sprintf("     %s\n", e$message))
+    
+    list(
+      nome = nome_quartil,
+      sucesso = FALSE,
+      erro = e$message
+    )
+  })
+}
+
+```
+
+# RODAR ANÁLISE PARA CADA QUARTIL
+
+```{r analise_quartil}
+resultados_quartis <- list()
+
+for(q in 1:4) {
+  
+  # Filtrar dados do quartil
+  dados_q <- dados %>% filter(quartil_pib == q)
+  
+  # Nome do quartil
+  nome_q <- unique(dados_q$quartil_pib_label)[1]
+  
+  # Rodar CS
+  resultado <- rodar_cs_quartil(dados_q, nome_q)
+  
+  # Guardar
+  resultados_quartis[[q]] <- resultado
+}
+```
+
+# TABELA COMPARATIVA
+
+```{r resultados}
+# Criar tabela
+tabela_resultados <- tibble(
+  Quartil = character(),
+  N_Municipios = integer(),
+  N_Tratados = integer(),
+  ATT = numeric(),
+  SE = numeric(),
+  P_valor = numeric(),
+  IC_95_lower = numeric(),
+  IC_95_upper = numeric(),
+  Significancia = character()
+)
+
+for(i in 1:4) {
+  res <- resultados_quartis[[i]]
+  
+  if(res$sucesso) {
+    att <- res$agg_simple$overall.att
+    se <- res$agg_simple$overall.se
+    p_val <- 2 * pnorm(-abs(att / se))
+    
+    # Intervalo de confiança 95%
+    ic_lower <- att - 1.96 * se
+    ic_upper <- att + 1.96 * se
+    
+    # Significância
+    sig <- case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      p_val < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+    
+    tabela_resultados <- tabela_resultados %>%
+      add_row(
+        Quartil = res$nome,
+        N_Municipios = res$n_mun,
+        N_Tratados = res$n_tratados,
+        ATT = att,
+        SE = se,
+        P_valor = p_val,
+        IC_95_lower = ic_lower,
+        IC_95_upper = ic_upper,
+        Significancia = sig
+      )
+  } else {
+    tabela_resultados <- tabela_resultados %>%
+      add_row(
+        Quartil = res$nome,
+        N_Municipios = NA_integer_,
+        N_Tratados = NA_integer_,
+        ATT = NA_real_,
+        SE = NA_real_,
+        P_valor = NA_real_,
+        IC_95_lower = NA_real_,
+        IC_95_upper = NA_real_,
+        Significancia = "ERRO"
+      )
+  }
+}
+
+print(tabela_resultados, n = 4)
+cat("\n")
+
+# Formatação bonita para apresentação
+cat("FORMATAÇÃO PARA PAPER:\n")
+cat(paste(rep("-", 80), collapse=""), "\n")
+cat("| Quartil PIB      | N    | ATT        | SE        | P-valor | IC 95%              | Sig |\n")
+cat("|------------------|------|------------|-----------|---------|---------------------|-----|\n")
+
+for(i in 1:nrow(tabela_resultados)) {
+  row <- tabela_resultados[i,]
+  
+  if(!is.na(row$ATT)) {
+    cat(sprintf("| %-16s | %4d | %+.6f | %.6f | %.4f  | [%+.6f, %+.6f] | %-3s |\n",
+                row$Quartil,
+                row$N_Tratados,
+                row$ATT,
+                row$SE,
+                row$P_valor,
+                row$IC_95_lower,
+                row$IC_95_upper,
+                row$Significancia))
+  } else {
+    cat(sprintf("| %-16s | ---- | ---------- | --------- | ------- | ------------------- | --- |\n",
+                row$Quartil))
+  }
+}
+
+```
+
+# ANÁLISE DE PADRÃO
+
+```{r corr_quartil_att}
+# Calcular correlação quartil × ATT
+atts_validos <- tabela_resultados %>%
+  filter(!is.na(ATT))
+
+if(nrow(atts_validos) >= 3) {
+  
+  # Correlação
+  cor_quartil_att <- cor(1:nrow(atts_validos), atts_validos$ATT)
+  
+  cat(sprintf("Correlação (Quartil × ATT): %.3f\n\n", cor_quartil_att))
+  
+  if(abs(cor_quartil_att) > 0.7) {
+    if(cor_quartil_att > 0) {
+      cat("📈 PADRÃO: Correlação positiva forte\n")
+      cat("   → Quanto MAIOR o PIB, MAIOR o efeito (menos negativo ou mais positivo)\n\n")
+    } else {
+      cat("📉 PADRÃO: Correlação negativa forte\n")
+      cat("   → Quanto MAIOR o PIB, MENOR o efeito (mais negativo)\n\n")
+    }
+  } else {
+    cat("➡️ PADRÃO: Correlação fraca/moderada\n")
+    cat("   → Relação não-linear ou sem padrão claro\n\n")
+  }
+  
+  # Teste de tendência linear
+  modelo_tendencia <- lm(ATT ~ I(1:nrow(atts_validos)), data = atts_validos)
+  p_tendencia <- summary(modelo_tendencia)$coefficients[2,4]
+  
+  cat(sprintf("Teste de tendência linear: p = %.4f %s\n\n",
+              p_tendencia,
+              ifelse(p_tendencia < 0.05, "***", "")))
+  
+  # Identificar padrões especiais
+  cat("COMPARAÇÕES RELEVANTES:\n\n")
+  
+  # Q1 vs Q4
+  if(!is.na(atts_validos$ATT[1]) && !is.na(atts_validos$ATT[4])) {
+    diff_q1_q4 <- atts_validos$ATT[4] - atts_validos$ATT[1]
+    cat(sprintf("Q1 (Baixo PIB) vs Q4 (Alto PIB):\n"))
+    cat(sprintf("  Q1 ATT: %+.6f\n", atts_validos$ATT[1]))
+    cat(sprintf("  Q4 ATT: %+.6f\n", atts_validos$ATT[4]))
+    cat(sprintf("  Diferença: %+.6f (%.1f%%)\n\n",
+                diff_q1_q4,
+                100 * abs(diff_q1_q4) / abs(atts_validos$ATT[1])))
+  }
+  
+} else {
+  cat("⚠️ Poucos quartis com resultados válidos para análise de padrão\n\n")
+}
+
+```
+
+# EVENT STUDIES POR QUARTIL
+
+```{r quartil_event_study}
+# Criar gráficos para cada quartil
+library(ggplot2)
+library(gridExtra)
+
+plots_event <- list()
+
+for(i in 1:4) {
+  res <- resultados_quartis[[i]]
+  
+  if(res$sucesso) {
+    
+    # Extrair dados do event study
+    event_df <- tibble(
+      tempo = res$agg_dynamic$egt,
+      att = res$agg_dynamic$att.egt,
+      se = res$agg_dynamic$se.egt
+    ) %>%
+      mutate(
+        ic_lower = att - 1.96 * se,
+        ic_upper = att + 1.96 * se,
+        pre_post = ifelse(tempo < 0, "Pre", "Post")
+      )
+    
+    # Pré-tendências
+    pre_trends <- event_df %>% filter(tempo < 0)
+    n_sig_pre <- sum(abs(pre_trends$att / pre_trends$se) > 1.96, na.rm = TRUE)
+    pct_violacao <- 100 * n_sig_pre / nrow(pre_trends)
+    
+    # Gráfico
+    p <- ggplot(event_df, aes(x = tempo, y = att, color = pre_post)) +
+      geom_point(size = 2) +
+      geom_errorbar(aes(ymin = ic_lower, ymax = ic_upper), width = 0.5) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+      geom_vline(xintercept = -0.5, linetype = "dotted", color = "gray50") +
+      labs(
+        title = res$nome,
+        subtitle = sprintf("N=%d | Pré-trend: %.1f%% | ATT=%.6f %s",
+                          res$n_tratados,
+                          pct_violacao,
+                          res$agg_simple$overall.att,
+                          ifelse(2*pnorm(-abs(res$agg_simple$overall.att/res$agg_simple$overall.se)) < 0.05, "*", "")),
+        x = "Períodos relativos ao tratamento",
+        y = "ATT"
+      ) +
+      scale_color_manual(values = c("Pre" = "coral", "Post" = "steelblue")) +
+      theme_minimal() +
+      theme(
+        legend.position = "none",
+        plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9)
+      )
+    
+    plots_event[[i]] <- p
+    
+  } else {
+    # Placeholder para quartis com erro
+    plots_event[[i]] <- ggplot() +
+      annotate("text", x = 0, y = 0, 
+               label = sprintf("%s\nERRO: %s", res$nome, res$erro),
+               size = 4, color = "red") +
+      theme_void()
+  }
+}
+
+# Combinar plots
+p_combined <- grid.arrange(
+  plots_event[[1]], plots_event[[2]],
+  plots_event[[3]], plots_event[[4]],
+  ncol = 2
+)
+
+# Salvar
+ggsave("event_study_por_quartil_PIB.png", 
+       p_combined, 
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+
+cat("✅ Gráfico salvo: event_study_por_quartil_PIB.png\n\n")
+```
+
+# GRÁFICO: ATT × QUARTIL PIB
+
+```{r plot_att_quartil}
+# Criar gráfico de barras com erro
+p_barras <- tabela_resultados %>%
+  filter(!is.na(ATT)) %>%
+  mutate(
+    Quartil_num = 1:n(),
+    Significativo = P_valor < 0.05
+  ) %>%
+  ggplot(aes(x = Quartil_num, y = ATT, fill = Significativo)) +
+  geom_col(alpha = 0.7, width = 0.6) +
+  geom_errorbar(aes(ymin = IC_95_lower, ymax = IC_95_upper), 
+                width = 0.2, linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(
+    breaks = 1:4,
+    labels = c("Q1\n(Baixo PIB)", "Q2\n(Médio-Baixo)", 
+               "Q3\n(Médio-Alto)", "Q4\n(Alto PIB)")
+  ) +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "gray70")) +
+  labs(
+    title = "Efeito Dose-Response por Quartil de PIB Per Capita",
+    subtitle = "Barras representam ATT | Linhas representam IC 95%",
+    x = "Quartil de PIB Per Capita",
+    y = "ATT (Efeito sobre Índice Esteban-Ray)",
+    fill = "Significativo\n(p<0.05)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    axis.title = element_text(size = 12),
+    legend.position = "right"
+  )
+
+ggsave("ATT_por_quartil_PIB.png", 
+       p_barras, 
+       width = 10, 
+       height = 6, 
+       dpi = 300)
+
+cat("✅ Gráfico salvo: ATT_por_quartil_PIB.png\n\n")
+```
+
+# EXPORTAR RESULTADOS
+
+```{r export_resulta}
+# Salvar tabela
+write_csv(tabela_resultados, "resultados_quartis_PIB.csv")
+cat("✅ Tabela salva: resultados_quartis_PIB.csv\n\n")
+
+# Salvar estatísticas descritivas
+write_csv(stats_quartis, "estatisticas_quartis_PIB.csv")
+cat("✅ Estatísticas salvas: estatisticas_quartis_PIB.csv\n\n")
+```
+
+# RESUMO EXECUTIVO
+
+```{r}
+cat("PRINCIPAIS ACHADOS:\n\n")
+# Identificar padrão
+atts_ordenados <- tabela_resultados %>%
+  filter(!is.na(ATT)) %>%
+  arrange(Quartil)
+
+if(nrow(atts_ordenados) >= 3) {
+  
+  # Correlação
+  cor_q_att <- cor(1:nrow(atts_ordenados), atts_ordenados$ATT)
+  
+  cat(sprintf("1. PADRÃO GERAL:\n"))
+  
+  if(cor_q_att > 0.5) {
+    cat("   ✅ Efeito AUMENTA com PIB (correlação positiva)\n")
+    cat("   → Municípios RICOS: efeito mais positivo/menos negativo\n")
+    cat("   → Municípios POBRES: efeito mais negativo/menos positivo\n\n")
+  } else if(cor_q_att < -0.5) {
+    cat("   ✅ Efeito DIMINUI com PIB (correlação negativa)\n")
+    cat("   → Municípios RICOS: efeito mais negativo\n")
+    cat("   → Municípios POBRES: efeito menos negativo/positivo\n\n")
+  } else {
+    cat("   ⚠️ Relação NÃO-LINEAR ou SEM PADRÃO CLARO\n")
+    cat("   → Verifique curva U ou U invertida\n\n")
+  }
+  
+  # Significância por quartil
+  cat("2. SIGNIFICÂNCIA ESTATÍSTICA:\n")
+  for(i in 1:nrow(atts_ordenados)) {
+    sig_status <- ifelse(atts_ordenados$P_valor[i] < 0.05, "SIM ✓", "NÃO")
+    cat(sprintf("   %s: %s (p=%.4f)\n", 
+                atts_ordenados$Quartil[i], 
+                sig_status, 
+                atts_ordenados$P_valor[i]))
+  }
+  cat("\n")
+  
+  # Magnitude
+  cat("3. MAGNITUDE DOS EFEITOS:\n")
+  maior_efeito <- atts_ordenados %>% filter(abs(ATT) == max(abs(ATT)))
+  menor_efeito <- atts_ordenados %>% filter(abs(ATT) == min(abs(ATT)))
+  
+  cat(sprintf("   Maior efeito (magnitude): %s (ATT = %+.6f)\n",
+              maior_efeito$Quartil, maior_efeito$ATT))
+  cat(sprintf("   Menor efeito (magnitude): %s (ATT = %+.6f)\n\n",
+              menor_efeito$Quartil, menor_efeito$ATT))
+  
+  # Comparação extremos
+  if(!is.na(atts_ordenados$ATT[1]) && !is.na(atts_ordenados$ATT[nrow(atts_ordenados)])) {
+    diff_extremos <- atts_ordenados$ATT[nrow(atts_ordenados)] - atts_ordenados$ATT[1]
+    cat("4. COMPARAÇÃO EXTREMOS (Q1 vs Q4):\n")
+    cat(sprintf("   Diferença: %+.6f\n", diff_extremos))
+    cat(sprintf("   Variação: %.1f%%\n\n", 
+                100 * abs(diff_extremos) / abs(atts_ordenados$ATT[1])))
+  }
+}
+
+cat("ARQUIVOS GERADOS:\n")
+cat("  - event_study_por_quartil_PIB.png\n")
+cat("  - ATT_por_quartil_PIB.png\n")
+cat("  - resultados_quartis_PIB.csv\n")
+cat("  - estatisticas_quartis_PIB.csv\n")
+cat("\n")
+```
+
