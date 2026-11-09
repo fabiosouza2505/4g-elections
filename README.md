@@ -1,14 +1,13 @@
-# 4G and Electoral Bipolarization in Brazil (2006–2022)
+# Political Polarization and Brazil’s 4G Rollout (2006–2022)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Replication materials for:
 
-> **Infraestrutura Digital e Bipolarização Eleitoral no Brasil: Um DiD Escalonado com Identificação Transparente (2006–2022)**
-> *(Digital Infrastructure and Electoral Bipolarization in Brazil: A Staggered DiD with Transparent Identification)*
-> Fabio de Medeiros Souza and Priscila Honório Evangelista de Souza — Universidade de Brasília (UnB)
+> **Designed for Coverage, Not Identification: Political Polarization and the Credibility of Causal Evidence from Brazil’s 4G Rollout**  
+> Priscila Honório Evangelista and Fábio de Medeiros Souza — Universidade de Brasília (UnB)
 
-**Status:** accepted for presentation at the 48th Brazilian Meeting of Econometrics (Encontro Brasileiro de Econometria, SBE). The final accepted version of the paper will be added to `paper/` when available.
+**Status:** accepted for presentation at the 48th Brazilian Meeting of Econometrics (Encontro Brasileiro de Econometria, SBE) — session *Egg Timer Applied Microeconomics 3 – Politics, Crime, Cities and Climate*, Friday, December 18, 2026, 09:00–10:45. The final accepted version of the paper will be added to `paper/` when available.
 
 ## Summary
 
@@ -88,11 +87,11 @@ Recommended order: `esteban_ray_corr/notyet_reg` and `wolfson/notyet_reg` (main 
 ## Citation
 
 ```bibtex
-@unpublished{souza_souza_2026_4g,
-  author = {Souza, Fabio de Medeiros and Souza, Priscila Hon{\'o}rio Evangelista de},
-  title  = {Infraestrutura Digital e Bipolariza{\c{c}}{\~a}o Eleitoral no Brasil: Um DiD Escalonado com Identifica{\c{c}}{\~a}o Transparente (2006--2022)},
+@unpublished{evangelista_souza_2026_4g,
+  author = {Evangelista, Priscila Hon{\'o}rio and Souza, F{\'a}bio de Medeiros},
+  title  = {Designed for Coverage, Not Identification: Political Polarization and the Credibility of Causal Evidence from {Brazil's} {4G} Rollout},
   year   = {2026},
-  note   = {Paper accepted at the 48th Brazilian Meeting of Econometrics (SBE). Universidade de Bras{\'i}lia}
+  note   = {Paper presented at the 48th Brazilian Meeting of Econometrics (SBE). Universidade de Bras{\'i}lia}
 }
 ```
 

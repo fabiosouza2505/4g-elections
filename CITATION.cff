@@ -1,12 +1,12 @@
 cff-version: 1.2.0
 message: "If you use this code or data, please cite the paper below."
-title: "Infraestrutura Digital e Bipolarização Eleitoral no Brasil: Um DiD Escalonado com Identificação Transparente (2006–2022)"
+title: "Designed for Coverage, Not Identification: Political Polarization and the Credibility of Causal Evidence from Brazil’s 4G Rollout"
 authors:
-  - family-names: Souza
-    given-names: Fabio de Medeiros
+  - family-names: Evangelista
+    given-names: Priscila Honório
     affiliation: Universidade de Brasília
   - family-names: Souza
-    given-names: Priscila Honório Evangelista de
+    given-names: Fábio de Medeiros
     affiliation: Universidade de Brasília
 year: 2026
 license: MIT
