@@ -1,4 +1,4 @@
-# Political Polarization and Brazil’s 4G Rollout (2006–2022)
+# Designed for Coverage, Not Identification: Political Polarization and the Credibility of Causal Evidence from Brazil’s 4G Rollout (2006–2022)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
