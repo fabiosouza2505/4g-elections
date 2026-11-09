@@ -1,139 +1,105 @@
-# 4g-elections
+# 4G and Electoral Bipolarization in Brazil (2006–2022)
 
-# Digital Technology and Electoral Polarization in Brazil (2010-2022)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Replication materials for:
 
-## Overview
+> **Infraestrutura Digital e Bipolarização Eleitoral no Brasil: Um DiD Escalonado com Identificação Transparente (2006–2022)**
+> *(Digital Infrastructure and Electoral Bipolarization in Brazil: A Staggered DiD with Transparent Identification)*
+> Fabio de Medeiros Souza and Priscila Honório Evangelista de Souza — Universidade de Brasília (UnB)
 
-This repository contains the replication materials for the paper investigating the causal relationship between 4G mobile network expansion and electoral polarization in Brazil during the 2010-2022 period.
+**Status:** accepted for presentation at the 48th Brazilian Meeting of Econometrics (Encontro Brasileiro de Econometria, SBE). The final accepted version of the paper will be added to `paper/` when available.
 
-**Authors:** Fabio de Medeiros Souza and Priscila Honório Evangelista de Souza  
-**Affiliation:** Universidade de Brasília (UnB)  
-**Course:** Public Sector Economics (Prof. Maurício Bugarin)
+## Summary
 
-## Abstract
+We study how the rollout of 4G mobile infrastructure affected the *bipolarization* of presidential voting in Brazilian municipalities. Party positions come from Zucco & Power; polarization is measured with the Esteban–Ray index and the Foster–Wolfson bipolarization index. The contribution has three parts:
 
-This study examines how the expansion of 4G mobile networks affected political polarization in Brazilian municipalities. Using a staggered difference-in-differences approach with Callaway & Sant'Anna (2021) methodology, we analyze 4,123 municipalities across four electoral cycles (2010, 2014, 2018, 2022). We find that 4G access increased electoral polarization by approximately 2.3%, measured through the Esteban-Ray polarization index. The analysis controls for pre-existing 3G infrastructure to isolate the incremental effect of 4G technology, particularly its capacity for video streaming and multimedia consumption via platforms like WhatsApp.
+1. **Measurement.** Measurement choices materially change conclusions. Including the PSL (Bolsonaro's party) in the 2018 ideology map raises the 2018 Esteban–Ray index from 0.056 to 0.107, which places the real jump in polarization between 2014 and 2018.
+2. **Design.** We build a consolidated panel of five national elections (2006, 2010, 2014, 2018, 2022; 28,479 municipality-year observations). Because 4G arrives in 2013, there are two pre-treatment periods, so parallel trends can be tested in the Callaway & Sant'Anna (2021) estimator. Cohorts: 2014 (968 municipalities), 2018 (1,807), 2022 (1,783) and never-treated (1,270).
+3. **Identification.** The 4G rollout is endogenous to the polarization trajectory. Early-cohort pre-trends are positive and significant, and the 2022 cohort's are negative. Correcting for observables does **not** remove the violation: not-yet vs. never-treated controls and outcome regression vs. doubly robust estimation (Sant'Anna & Zhao, 2020) leave the pre-trends essentially unchanged. We quantify the remaining robustness with Honest-DiD (Rambachan & Roth, 2023).
 
-## Repository Structure
+### Main estimates (Model 3b, CS dynamic aggregation, full sample)
+
+| Outcome | Control group | Method | ATT | p-value |
+|---|---|---|---|---|
+| Esteban–Ray (PSL-corrected) | not-yet-treated | reg | +0.0013 | 0.013 |
+| Esteban–Ray (PSL-corrected) | not-yet-treated | DR | +0.0024 | <0.001 |
+| Esteban–Ray (PSL-corrected) | never-treated | reg | +0.0012 | 0.031 |
+| Esteban–Ray (PSL-corrected) | never-treated | DR | +0.0026 | <0.001 |
+| Foster–Wolfson | not-yet-treated | reg | +0.0240 | <0.001 |
+
+**Honest-DiD (relative magnitudes).** The robust confidence interval for the average post-treatment effect excludes zero up to M̄ ≈ 0.1 for Esteban–Ray (fragile) and up to M̄ ≈ 0.6 for Wolfson (suggestive). Neither survives the conventional benchmark M̄ = 1. We read the results as **suggestive evidence of amplification** of bipolarization. Strong causal identification will need an exogenous supply-side instrument for the rollout.
+
+Model 3b controls: `bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais` (fixed broadband density in 2010, years of 3G, 4G stations per km², log GDP per capita, share of adults with secondary education or more).
+
+## Repository structure
 
 ```
+├── code/build/              Python pipeline: raw data → consolidated panel
 ├── data/
-│   ├── raw/                    # Original datasets (not included - see Data Availability)
-│   └── processed/              # Cleaned and merged datasets
-├── code/
-│   ├── cleaning/               # Data cleaning and merging scripts (Python)
-│   ├── analysis/               # Econometric analysis (R)
-│   └── figures/                # Figure generation scripts
-├── docs/
-│   ├── data_documentation.md   # Detailed data source documentation
-│   └── methodology.md          # Extended methodology notes
-├── output/
-│   ├── tables/                 # Regression tables and summary statistics
-│   └── figures/                # All figures used in the paper
-├── README.md                   # This file
-└── requirements.txt            # Python dependencies
-
+│   ├── raw/                 Small raw inputs (TSE–IBGE crosswalk, Zucco–Power estimates, IBGE GDP/population, SIDRA 1554)
+│   ├── intermediate/        Processed TSE votes, municipal polarization by year, ANATEL, GDP per capita, education, ideology maps
+│   └── processed/           painel_consolidado_2006_2022.csv (analysis panel)
+├── estimation/
+│   ├── esteban_ray_corr/    CS-DiD on the PSL-corrected Esteban–Ray index
+│   │   ├── notyet_reg/      not-yet-treated, outcome regression (+ quartile/matrix heterogeneity)
+│   │   ├── notyet_dr/       not-yet-treated, doubly robust
+│   │   ├── never_reg/       never-treated, outcome regression
+│   │   └── never_dr/        never-treated, doubly robust
+│   ├── wolfson/notyet_reg/  CS-DiD on the Foster–Wolfson index (+ heterogeneity)
+│   └── honest_did/          Rambachan–Roth sensitivity analysis
+├── figures/                 Figures used in the paper
+└── archive/v1_2010_2022/    Earlier version of the project (2010–2022 panel, 4 elections)
 ```
 
-## Data Availability
+Each estimation folder holds the R Markdown file and its outputs (`resultados_staggered/`, `resultados_quartil/`): `resultados_<id>.csv` (aggregated ATTs), `att_gt_<id>.csv` (group-time ATTs), `tabela_estabilidade_att_educacao.csv` (stability across the specification families 1a–4d) and event-study plots.
 
-Due to file size constraints, raw data files are not included in this repository. All data sources are publicly available:
+## Replication
 
-1. **Electoral Data (TSE)**: [Tribunal Superior Eleitoral](https://dadosabertos.tse.jus.br/)
-2. **Telecommunications Data (ANATEL)**: [Agência Nacional de Telecomunicações](https://www.anatel.gov.br/dados/)
-3. **Demographic Data (IBGE)**: [Instituto Brasileiro de Geografia e Estatística](https://www.ibge.gov.br/)
-4. **Party Ideology Classifications**: Zucco & Power (Harvard Dataverse)
+### 1. Build the panel (optional; the panel is already in `data/processed/`)
 
-See `docs/data_documentation.md` for detailed instructions on downloading and preparing the raw data.
+Large raw files are not included because of GitHub's size limits. Download them from:
 
-## Replication Instructions
+- **TSE** – `votacao_candidato_munzona_<ano>_BRASIL.csv` for 2006–2022: <https://dadosabertos.tse.jus.br/>
+- **ANATEL** – `Estacoes_SMP.csv` (mobile base stations) and `Densidade_Banda_Larga_Fixa.csv`: <https://informacoes.anatel.gov.br/paineis/>
+- **Zucco & Power** – party ideology estimates (included in `data/raw/`): Harvard Dataverse
 
-### Prerequisites
+The scripts read and write files in the current working directory. Put all inputs in one folder and run from it, in this order:
 
-**Python Requirements:**
-- Python 3.8+
-- pandas
-- numpy
-- See `requirements.txt` for complete list
-
-**R Requirements:**
-- R 4.0+
-- did (Callaway & Sant'Anna estimator)
-- fixest
-- ggplot2
-- See R script headers for complete package list
-
-### Step-by-Step Replication
-
-1. **Download raw data** following instructions in `docs/data_documentation.md`
-
-2. **Data cleaning and merging** (Python):
 ```bash
-cd code/cleaning
-python 01_clean_tse_data.py
-python 02_clean_anatel_data.py
-python 03_merge_datasets.py
+python code/build/classe_ideology.py         # party ideology maps per election (ideology_<ano>.json)
+python code/build/class_polarization.py      # TSE votes → municipal polarization indices
+python code/build/class_anatel.py            # 3G/4G rollout, station intensity, broadband
+python code/build/class_educ_data.py         # Census 2010 education controls (SIDRA 1554)
+python code/build/class_renda.py             # GDP per capita
+python code/build/build_painel_consolidado.py  # → painel_consolidado_2006_2022.csv
 ```
 
-3. **Main analysis** (R):
-```bash
-cd code/analysis
-Rscript 01_descriptive_statistics.R
-Rscript 02_staggered_did.R
-Rscript 03_robustness_checks.R
-```
+Python dependencies are listed in `requirements.txt`.
 
-4. **Generate figures**:
-```bash
-cd code/figures
-Rscript generate_all_figures.R
-```
+### 2. Estimation (R)
 
-## Key Findings
+Open each `.Rmd` and knit it with the working directory set to its own folder (the RStudio default). Each one reads `data/processed/painel_consolidado_2006_2022.csv` by relative path.
 
-- Electoral polarization increased dramatically from 2014 to 2018 (+59%)
-- 4G network expansion contributed approximately 2.3% to polarization increases
-- Effects are distinct from general internet access, representing the incremental impact of 4G over 3G
-- Results robust to alternative specifications and control strategies
+R packages: `did`, `HonestDiD`, `fixest`, `tidyverse`, `cowplot`.
 
-## Methodology Highlights
-
-- **Identification Strategy**: Staggered difference-in-differences with Callaway & Sant'Anna (2021)
-- **Treatment**: 4G network availability at municipal level
-- **Outcome**: Esteban-Ray polarization index
-- **Controls**: 3G infrastructure, municipal fixed effects, time fixed effects
-- **Sample**: 16,489 municipality-election observations (4,123 municipalities × 4 elections)
+Recommended order: `esteban_ray_corr/notyet_reg` and `wolfson/notyet_reg` (main results), the three other `esteban_ray_corr` folders (2×2 control-group × method check), then `honest_did`.
 
 ## Citation
 
-If you use this code or data in your research, please cite:
-
 ```bibtex
-@unpublished{surname2024digital,
-  author = {[Surname], Fabio and Souza, Priscila Hon{\'o}rio Evangelista},
-  title = {Digital Technology and Electoral Polarization in Brazil: Evidence from 4G Network Expansion},
-  year = {2024},
-  note = {Working Paper, Universidade de Bras{\'i}lia}
+@unpublished{souza_souza_2026_4g,
+  author = {Souza, Fabio de Medeiros and Souza, Priscila Hon{\'o}rio Evangelista de},
+  title  = {Infraestrutura Digital e Bipolariza{\c{c}}{\~a}o Eleitoral no Brasil: Um DiD Escalonado com Identifica{\c{c}}{\~a}o Transparente (2006--2022)},
+  year   = {2026},
+  note   = {Paper accepted at the 48th Brazilian Meeting of Econometrics (SBE). Universidade de Bras{\'i}lia}
 }
 ```
 
 ## License
 
-This project is licensed under the MIT License - see LICENSE file for details.
-
-## Contact
-
-For questions or comments, please contact:
-- Fabio de Medeiros Souza: [email]
-- Priscila Honório Evangelista de Souza: [email]
+MIT. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-We thank Prof. Maurício Bugarin for guidance, our colleague at ANATEL for technical assistance with telecommunications data, and the broader academic community studying technology's effects on political behavior.
-
----
-
-**Last Updated:** December 2025
-
+We thank Prof. Maurício Bugarin (UnB) for guidance and a colleague at ANATEL for technical help with the telecommunications data.

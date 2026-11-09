@@ -1,0 +1,15 @@
+Modelo,xformla,ATT,SE,Pvalor,Sig
+(1a) Sem PIB + erbs_per_1000hab - CS SIMPLE,anos_3g + erbs_per_1000hab,6.749340562357519e-4,5.303198081624841e-4,0.2031271708271915,
+(1a) Sem PIB + erbs_per_1000hab - CS DYNAMIC,anos_3g + erbs_per_1000hab,9.030158252203398e-4,5.633080206539463e-4,0.1089216942547355,
+(1b) Sem PIB + erbs_per_km2 - CS SIMPLE,anos_3g + erbs_per_km2,0.0022709749774292407,5.269567169567242e-4,1.6354685065553757e-5,***
+(1b) Sem PIB + erbs_per_km2 - CS DYNAMIC,anos_3g + erbs_per_km2,0.002624470438536623,5.660049352951477e-4,3.537877919889068e-6,***
+(2a) + PIB + erbs_per_1000hab - CS SIMPLE,anos_3g + erbs_per_1000hab + log_pib_pc,8.127769688525448e-4,5.226786577040206e-4,0.11994075822785259,
+(2a) + PIB + erbs_per_1000hab - CS DYNAMIC,anos_3g + erbs_per_1000hab + log_pib_pc,0.00103351818592946,5.548239583560495e-4,0.06249240997809181,*
+(2b) + PIB + erbs_per_km2 - CS SIMPLE,anos_3g + erbs_per_km2 + log_pib_pc,0.0017410863606634218,5.098375558821241e-4,6.378609599479789e-4,***
+(2b) + PIB + erbs_per_km2 - CS DYNAMIC,anos_3g + erbs_per_km2 + log_pib_pc,0.0021231414223202945,5.755929305851464e-4,2.2547702348851842e-4,***
+(3a) + PIB + Educação + erbs_per_1000hab - CS SIMPLE,anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais,9.694167382456245e-4,4.8158868485934217e-4,0.044119279073284244,**
+(3a) + PIB + Educação + erbs_per_1000hab - CS DYNAMIC,anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais,0.0011327075614429817,5.153390780169052e-4,0.027950175154417948,**
+(3b) + PIB + Educação + erbs_per_km2 - CS SIMPLE,anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais,0.0022153457155520517,4.8691194735573685e-4,5.370021026382751e-6,***
+(3b) + PIB + Educação + erbs_per_km2 - CS DYNAMIC,anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais,0.002586796485814143,5.566320617809067e-4,3.364241373917664e-6,***
+(4a) + PIB + Baixa instrução - CS SIMPLES,anos_3g + erbs_per_1000hab + log_pib_pc + prop_baixa_instrucao,8.938435766424186e-4,5.23431629009518e-4,0.08769933439808952,*
+(4a) + PIB + Baixa instrução - CS DYNAMIC,anos_3g + erbs_per_1000hab + log_pib_pc + prop_baixa_instrucao,0.0010625744855399853,4.91943199286087e-4,0.030776261547937913,**

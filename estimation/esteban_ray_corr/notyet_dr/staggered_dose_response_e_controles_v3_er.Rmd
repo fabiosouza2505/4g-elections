@@ -1,0 +1,812 @@
+---
+title: "staggered_dose_response_e_controles_v2"
+author: "Fabio de Medeiros e Priscila Evangelista"
+date: "2025-12-06"
+output: html_document
+---
+
+# ============================================================================
+# DOSE-RESPONSE STAGGERED COM CONTROLE DE PIB
+# ============================================================================
+
+# ============================================================================
+# Configurações iniciais
+# ============================================================================
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env, echo=TRUE}
+rm(list = ls())
+gc()
+```
+
+
+
+```{r Packages}
+# Packages
+library(tidyverse)
+library(did)
+library(fixest)
+library(stats)
+```
+
+```{r configurar_saida}
+# ── Pasta de saída ────────────────────────────────────────────────────────────
+# Altere o caminho abaixo para definir onde todos os resultados serão salvos.
+# A pasta é criada automaticamente se não existir.
+# ─────────────────────────────────────────────────────────────────────────────
+dir_output <- "resultados_staggered"
+
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat(sprintf("✅ Pasta de saída: %s\n", normalizePath(dir_output)))
+```
+
+# ============================================================================
+# Passo 1: Carregar dados
+# ============================================================================
+```{r load_data}
+# ── Painel consolidado 2006–2022 (gerado por build_painel_consolidado.py) ──────
+# Estrutura nova: 5 períodos eleitorais (2006, 2010, 2014, 2018, 2022).
+#   • 2006 e 2010 são pré-4G para TODAS as coortes → 2 pré-períodos testáveis
+#     (a coorte 2014, antes intestável, agora tem 2006 e 2010 como pré).
+#   • never-treated ≈ 1.270 municípios (vs ~65 antes) → controle muito mais robusto.
+# O painel principal fica em estimation/; este script roda em estimation/ER_corr/.
+# Ajuste o caminho se o working directory do knit não for a subpasta.
+dados <- read_csv("../../../data/processed/painel_consolidado_2006_2022.csv",
+                  col_types = cols(codigo_tse = col_character()))
+
+cat(sprintf("✅ Painel carregado: %d linhas\n", nrow(dados)))
+cat(sprintf("   Municípios: %d\n", n_distinct(dados$codigo_tse)))
+cat(sprintf("   Anos: %s\n\n", paste(sort(unique(dados$ano)), collapse=", ")))
+
+# Verificar variáveis necessárias
+vars_necessarias <- c("esteban_ray_corr", "wolfson", "dist_bipolar", "dalton", "reynal_querol",
+                      "tem_4g", "anos_3g", "erbs_per_km2", "erbs_per_1000hab",
+                      "log_pib_pc", "prop_medio_mais", "prop_baixa_instrucao",
+                      "bl_densidade_2010", "bl_densidade_2010_win", "codigo_tse", "ano")
+
+faltando <- setdiff(vars_necessarias, names(dados))
+
+if (length(faltando) > 0) {
+  stop("Variáveis faltando: ", paste(faltando, collapse = ", "))
+} else {
+  cat("✅ Todas as variáveis necessárias presentes\n")
+}
+```
+# ============================================================================
+# Passo 2: Definir cohorts
+# ============================================================================
+
+```{r cohorts}
+# ID numérico
+mapeamento_id <- dados %>%
+  distinct(codigo_tse) %>%
+  arrange(codigo_tse) %>%
+  mutate(id = row_number())
+
+dados <- dados %>%
+  left_join(mapeamento_id, by = "codigo_tse")
+
+# Gname
+dados <- dados %>%
+  group_by(id) %>%
+  arrange(id, ano) %>%
+  mutate(
+    primeiro_ano_4g = ifelse(any(tem_4g == 1), min(ano[tem_4g == 1]), 0),
+    gname = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g)
+  ) %>%
+  ungroup()
+
+cat("Distribuição de cohorts:\n")
+cohort_dist <- dados %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  arrange(gname)
+print(cohort_dist)
+```
+# ============================================================================
+# Passo 3: Criar quartis para intensidade 4G, pib e educação
+# ============================================================================
+
+```{r quartis_intensidade_PIB_educ}
+
+# ------------------------------------------------------------
+# FUNÇÃO AUXILIAR
+# Calcula cortes em um subconjunto/ano de referência e
+# atribui quartis (1–4) a todas as linhas do painel.
+# NA é preservado; municípios sem 4G recebem 0 via pós-processamento.
+# ------------------------------------------------------------
+atribuir_quartis <- function(df, var, novo_col,
+                              filtro = NULL, ano_ref = NULL) {
+  dados_ref <- df
+  if (!is.null(filtro))  dados_ref <- dados_ref %>% filter(!!filtro)
+  if (!is.null(ano_ref)) dados_ref <- dados_ref %>% filter(ano == ano_ref)
+
+  cortes <- pull(dados_ref, {{ var }}) %>%
+    quantile(probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+  cat(sprintf("\nCortes de %s:\n", deparse(substitute(var))))
+  print(cortes)
+
+  df %>%
+    mutate(!!novo_col := case_when(
+      is.na({{ var }})              ~ NA_integer_,
+      {{ var }} <= cortes["25%"]    ~ 1L,
+      {{ var }} <= cortes["50%"]    ~ 2L,
+      {{ var }} <= cortes["75%"]    ~ 3L,
+      TRUE                          ~ 4L
+    ))
+}
+
+# ------------------------------------------------------------
+# FLAG: municípios que NUNCA tiveram 4G
+# ------------------------------------------------------------
+dados <- dados %>%
+  mutate(nunca_teve_4g = (gname == 0))
+
+# ------------------------------------------------------------
+# QUARTIS DE PIB — rank relativo dentro de cada ano
+# (ntile por ano: controla diferenças cross-sectionais de renda)
+# ------------------------------------------------------------
+dados <- dados %>%
+  group_by(ano) %>%
+  mutate(quartil_pib = ntile(pib_per_capita, 4)) %>%
+  ungroup()
+
+cat("Distribuição quartil_pib (2018):\n")
+dados %>% filter(ano == 2018) %>% count(quartil_pib) %>% print()
+
+# ------------------------------------------------------------
+# QUARTIS DE INTENSIDADE 4G — cortes fixos no cohort dominante
+# (evita distorção de calcular sobre painel empilhado)
+# ------------------------------------------------------------
+
+# Identifica o cohort com mais municípios tratados
+ano_ref_int <- dados %>%
+  filter(!nunca_teve_4g) %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  slice_max(n, n = 1) %>%
+  pull(gname)
+
+cat(sprintf("\nAno de referência para cortes de intensidade 4G: %d\n", ano_ref_int))
+
+filtro_km2  <- expr(!nunca_teve_4g & erbs_per_km2   > 0)
+filtro_hab  <- expr(!nunca_teve_4g & erbs_per_1000hab > 0)
+
+dados <- atribuir_quartis(dados, erbs_per_km2,    "quartil_intensidade_km2",
+                          filtro = filtro_km2, ano_ref = ano_ref_int)
+
+dados <- atribuir_quartis(dados, erbs_per_1000hab, "quartil_intensidade_hab",
+                          filtro = filtro_hab, ano_ref = ano_ref_int)
+
+# Municípios sem 4G recebem categoria 0
+dados <- dados %>%
+  mutate(
+    quartil_intensidade_km2 = if_else(nunca_teve_4g, 0L, quartil_intensidade_km2),
+    quartil_intensidade_hab = if_else(nunca_teve_4g, 0L, quartil_intensidade_hab)
+  )
+
+# ------------------------------------------------------------
+# QUARTIS DE EDUCAÇÃO — cortes fixos em 2010 (baseline pré-tratamento)
+# Dois modelos independentes: prop_medio_mais e prop_baixa_instrucao
+# A simetria esperada entre os dois serve como check de consistência:
+#   Q1(medio_mais) ≈ Q4(baixa_instrucao) e vice-versa
+# ------------------------------------------------------------
+dados <- atribuir_quartis(dados, prop_medio_mais,     "quartil_medio_mais",
+                          ano_ref = 2010)
+
+dados <- atribuir_quartis(dados, prop_baixa_instrucao, "quartil_baixa_instrucao",
+                          ano_ref = 2010)
+
+# ------------------------------------------------------------
+# LABELS
+# ------------------------------------------------------------
+rotular_quartil <- function(df, col_num, col_label, prefixo,
+                             zero_label = NA_character_) {
+  df %>% mutate(!!col_label := case_when(
+    .data[[col_num]] == 0L ~ zero_label,
+    .data[[col_num]] == 1L ~ paste0("Q1_", prefixo),
+    .data[[col_num]] == 2L ~ paste0("Q2_", prefixo),
+    .data[[col_num]] == 3L ~ paste0("Q3_", prefixo),
+    .data[[col_num]] == 4L ~ paste0("Q4_", prefixo)
+  ))
+}
+```
+
+# ============================================================================
+# Passo 4: Estimar
+# ============================================================================
+
+```{r definir_modelos_e_funcao}
+# ── Lista de especificações dos modelos ──────────────────────────────────────
+# Cada elemento define: id, grupo, descrição e fórmula de controles (xformla).
+# Para adicionar um novo modelo, basta incluir um novo elemento na lista.
+# ─────────────────────────────────────────────────────────────────────────────
+modelo_specs <- list(
+
+  # MODELO 1: SEM CONTROLE DE PIB (baseline)
+  list(id = "1a", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1a: ~ anos_3g + erbs_per_1000hab",
+       xformla   = ~ anos_3g + erbs_per_1000hab),
+
+  list(id = "1b", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1b: ~ anos_3g + erbs_per_km2",
+       xformla   = ~ anos_3g + erbs_per_km2),
+
+  list(id = "1c", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1c: ~ bl_densidade_2010 + anos_3g + erbs_per_1000hab",
+       xformla   = ~ bl_densidade_2010 + anos_3g + erbs_per_1000hab),
+
+  list(id = "1d", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1d: ~ bl_densidade_2010 + anos_3g + erbs_per_km2",
+       xformla   = ~ bl_densidade_2010 + anos_3g + erbs_per_km2),
+
+  list(id = "1e", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1e: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2),
+
+  list(id = "1f", grupo = "Modelo 1 — Sem PIB",
+       descricao = "1f: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab),
+
+  # MODELO 2: COM CONTROLE DE PIB
+  list(id = "2a", grupo = "Modelo 2 — Com PIB",
+       descricao = "2a: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc),
+
+  list(id = "2b", grupo = "Modelo 2 — Com PIB",
+       descricao = "2b: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc),
+
+  # MODELO 3: COM CONTROLE EDUCAÇÃO
+  list(id = "3a", grupo = "Modelo 3 — baseline + Educação",
+       descricao = "3a: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + prop_medio_mais),
+
+  list(id = "3b", grupo = "Modelo 3 — Baseline + Educação",
+       descricao = "3b: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + prop_medio_mais),
+
+  list(id = "3c", grupo = "Modelo 3 — Baseline + Educação",
+       descricao = "3c: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + prop_baixa_instrucao",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + prop_baixa_instrucao),
+
+  list(id = "3d", grupo = "Modelo 3 — Baseline + Educação",
+       descricao = "3d: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + prop_baixa_instrucao",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + prop_baixa_instrucao),
+
+  
+  # MODELO 4: ROBUSTEZ — prop_baixa_instrucao no lugar de prop_medio_mais
+  list(id = "4a", grupo = "Modelo 4 — Baseline + PIB + Educação",
+       descricao = "4a: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais),
+  list(id = "4b", grupo = "Modelo 4 — Baseline + PIB + Educação",
+       descricao = "4b: ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_1000hab + log_pib_pc + prop_baixa_instrucao),
+  list(id = "4c", grupo = "Modelo 4 — Baseline + PIB + Educação",
+       descricao = "4c: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais),
+  list(id = "4d", grupo = "Modelo 4 — Baseline + PIB + Educação",
+       descricao = "4c: ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais",
+       xformla   = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_baixa_instrucao)
+)
+
+# ── Função de estimação padronizada ──────────────────────────────────────────
+# Recebe uma especificação de modelo e retorna lista com:
+#   $fit         — objeto att_gt completo (contém DIDparams)
+#   $simple      — aggte tipo "simple", amostra completa
+#   $dynamic     — aggte tipo "dynamic", amostra completa
+#   $simple_sem  — aggte tipo "simple", sem cohort excluído
+#   $dynamic_sem — aggte tipo "dynamic", sem cohort excluído (min_e / max_e)
+#
+# Arquivos salvos em dir_output para cada modelo:
+#   event_study_<id>_todos.png      — event study com todos os cohorts
+#   event_study_<id>_sem<cohort>.png — event study sem cohort excluído
+#   att_gt_<id>.csv                 — ATT(g,t) individuais
+#   resultados_<id>.csv             — ATTs agregados (simple/dynamic × completo/sem cohort)
+# ─────────────────────────────────────────────────────────────────────────────
+estimar_cs <- function(spec, dados,
+                       dir_output     = "resultados_staggered",
+                       cohort_excluir = 2022,
+                       min_e = -8, max_e = 8) {
+
+  id <- spec$id
+  cat(sprintf("\n%s\nMODELO %s: %s\n%s\n\n",
+              strrep("─", 70), toupper(id),
+              spec$descricao, strrep("─", 70)))
+
+  # ── att_gt ──────────────────────────────────────────────────────────────
+  cs_fit <- att_gt(
+    yname         = "esteban_ray_corr",
+    tname         = "ano",
+    idname        = "id",
+    gname         = "gname",
+    xformla       = spec$xformla,
+    data          = dados,
+    control_group = "notyettreated",
+    est_method    = "dr",
+    base_period   = "universal",
+    anticipation  = 0,
+    print_details = FALSE
+  )
+
+  # ── Função interna de impressão ──────────────────────────────────────────
+  print_att <- function(agg, label) {
+    pval <- 2 * pnorm(-abs(agg$overall.att / agg$overall.se))
+    cat(sprintf("RESULTADO (%s):\n  ATT: %+.6f | SE: %.6f | P-valor: %.4f\n\n",
+                label, agg$overall.att, agg$overall.se, pval))
+  }
+
+  # ── Agregações — amostra completa ────────────────────────────────────────
+  agg_simple  <- aggte(cs_fit, type = "simple", na.rm=TRUE)
+  agg_dynamic <- aggte(cs_fit, type = "dynamic",na.rm=TRUE)
+
+  print_att(agg_simple,  sprintf("MODELO %s — CS SIMPLE",  toupper(id)))
+  print_att(agg_dynamic, sprintf("MODELO %s — CS DYNAMIC", toupper(id)))
+
+  # ── Filtro do cohort problemático ────────────────────────────────────────
+  mask              <- cs_fit$group != cohort_excluir
+  cs_filtrado           <- cs_fit
+  cs_filtrado$group     <- cs_fit$group[mask]
+  cs_filtrado$t         <- cs_fit$t[mask]
+  cs_filtrado$att       <- cs_fit$att[mask]
+  cs_filtrado$se        <- cs_fit$se[mask]
+  cs_filtrado$inffunc   <- cs_fit$inffunc[, mask]
+
+  # ── Agregações — sem cohort excluído ─────────────────────────────────────
+  agg_simple_sem  <- aggte(cs_filtrado, type = "simple", na.rm = TRUE)
+  agg_dynamic_sem <- aggte(cs_fit,      type = "dynamic",
+                           min_e = min_e, max_e = max_e, na.rm=TRUE)
+
+  print_att(agg_simple_sem,
+            sprintf("MODELO %s — CS SIMPLE  (sem cohort %d)", toupper(id), cohort_excluir))
+  print_att(agg_dynamic_sem,
+            sprintf("MODELO %s — CS DYNAMIC (sem cohort %d)", toupper(id), cohort_excluir))
+
+  # ── Event study: todos os cohorts ────────────────────────────────────────
+  # t < 0 : pré-tendências (devem ser zero para validade do DiD)
+  # t = 0 : efeito imediato (pode ser contaminado pelo cohort excluído)
+  # t > 0 : efeitos pós-tratamento
+  p_todos <- ggdid(agg_dynamic) +
+    labs(title = paste0("Event Study — Modelo ", toupper(id), " (todos os cohorts)"))
+  print(p_todos)
+
+  # ── Event study: sem cohort excluído ─────────────────────────────────────
+  p_sem <- ggdid(agg_dynamic_sem) +
+    labs(title = paste0("Event Study — Modelo ", toupper(id),
+                        " (sem cohort ", cohort_excluir, ")")) +
+    annotate("rect",
+             xmin = -0.5, xmax = 0.5, ymin = -Inf, ymax = Inf,
+             alpha = 0.1, fill = "red") +
+    annotate("text", x = 0, y = Inf,
+             label = paste0("t=0: choque ", cohort_excluir),
+             vjust = 1.5, size = 3, color = "red")
+  print(p_sem)
+
+  # ── Salvar plots ─────────────────────────────────────────────────────────
+  ggsave(file.path(dir_output, sprintf("event_study_%s_todos.png", id)),
+         p_todos, width = 10, height = 6, dpi = 300, bg = "white")
+
+  ggsave(file.path(dir_output, sprintf("event_study_%s_sem%d.png", id, cohort_excluir)),
+         p_sem, width = 10, height = 6, dpi = 300, bg = "white")
+
+  # ── Salvar ATT(g,t) individuais ──────────────────────────────────────────
+  att_gt_df <- tibble(
+    modelo = id,
+    group  = cs_fit$group,
+    t      = cs_fit$t,
+    att    = cs_fit$att,
+    se     = cs_fit$se
+  ) %>%
+    filter(!is.na(se)) %>%
+    mutate(
+      p_valor  = 2 * pnorm(-abs(att / se)),
+      pre_post = ifelse(t < group, "pre", "pos")
+    )
+
+  write_csv(att_gt_df,
+            file.path(dir_output, sprintf("att_gt_%s.csv", id)))
+
+  # ── Salvar resumo dos ATTs agregados ─────────────────────────────────────
+  resumo_agg <- function(agg, tipo, amostra) {
+    pval <- 2 * pnorm(-abs(agg$overall.att / agg$overall.se))
+    tibble(
+      modelo  = id,
+      tipo    = tipo,
+      amostra = amostra,
+      att     = agg$overall.att,
+      se      = agg$overall.se,
+      p_valor = pval
+    )
+  }
+
+  resultados_df <- bind_rows(
+    resumo_agg(agg_simple,      "simple",  "completa"),
+    resumo_agg(agg_dynamic,     "dynamic", "completa"),
+    resumo_agg(agg_simple_sem,  "simple",  paste0("sem_", cohort_excluir)),
+    resumo_agg(agg_dynamic_sem, "dynamic", paste0("sem_", cohort_excluir))
+  )
+
+  write_csv(resultados_df,
+            file.path(dir_output, sprintf("resultados_%s.csv", id)))
+
+  cat(sprintf("💾 Modelo %s — arquivos salvos em '%s'\n", toupper(id), dir_output))
+
+  # ── Retorna lista nomeada com todos os objetos ────────────────────────────
+  invisible(list(
+    fit         = cs_fit,
+    simple      = agg_simple,
+    dynamic     = agg_dynamic,
+    simple_sem  = agg_simple_sem,
+    dynamic_sem = agg_dynamic_sem
+  ))
+}
+```
+
+```{r estimar_todos_modelos}
+# Estimação sequencial de todos os modelos definidos em modelo_specs.
+# Os resultados ficam acessíveis via: resultados[["<id>"]]$<componente>
+# Componentes disponíveis: fit | simple | dynamic | simple_sem | dynamic_sem
+resultados <- lapply(modelo_specs, estimar_cs, dados = dados, dir_output = dir_output)
+names(resultados) <- sapply(modelo_specs, `[[`, "id")
+
+cat(sprintf("\n✅ %d modelos estimados com sucesso.\n", length(resultados)))
+cat("IDs disponíveis: ", paste(names(resultados), collapse = ", "), "\n")
+cat(sprintf("📁 Resultados por modelo salvos em: %s\n", normalizePath(dir_output)))
+```
+
+# ============================================================================
+# Passo 5: event study por quartil
+# ============================================================================
+
+
+```{r event_study_quartil_educ_3b}
+# ── CONFIGURAR AQUI ─────────────────────────────────────────
+# cs_objeto: objeto aggte (dynamic) do modelo de referência — contém DIDparams
+# (corrigido: o modelo "3e" não existe em modelo_specs; usar 3b, que é a
+#  especificação preferida com educação)
+cs_objeto     <- resultados[["3b"]]$dynamic
+var_quartil   <- "quartil_medio_mais"
+labels_q      <- c("Q1 (Baixa Prop Educ Média)", "Q2 (Médio-Baixo Prop Educ Média)",
+                   "Q3 (Médio-Alto Prop Educ Média)", "Q4 (Alto Prop Educ Média)")
+titulo_figura <- "Event Study por Quartil de Educ — Modelo 3B"
+nome_arquivo  <- "event_study_quartil_Educ_Model3B.png"
+excluir_2022  <- TRUE
+# ─────────────────────────────────────────────────────────────
+
+library(cowplot)
+
+# Extrair parâmetros da estimação original para reusar
+params <- cs_objeto$DIDparams
+
+plots <- list()
+
+for (q in 1:4) {
+
+  dados_q <- dados %>%
+    filter(.data[[var_quartil]] == q) %>%
+    { if (excluir_2022) filter(., gname != 2022) else . }
+
+  n_mun <- n_distinct(dados_q$id)
+
+  cs_q <- tryCatch(
+    att_gt(
+      yname         = params$yname,
+      tname         = params$tname,
+      idname        = params$idname,
+      gname         = params$gname,
+      xformla       = params$xformla,
+      data          = dados_q,
+      control_group = params$control_group,
+      est_method    = params$est_method,
+      base_period   = params$base_period,
+      anticipation  = params$anticipation,
+      print_details = FALSE
+    ),
+    error = function(e) {
+      cat(sprintf("ERRO Q%d: %s\n", q, e$message))
+      NULL
+    }
+  )
+
+  if (is.null(cs_q)) {
+    plots[[q]] <- ggplot() +
+      annotate("text", x=0, y=0,
+               label=sprintf("Q%d: estimação falhou", q),
+               color="gray50") +
+      theme_void()
+    next
+  }
+
+  agg_dyn    <- aggte(cs_q, type="dynamic", na.rm=TRUE)
+  agg_simple <- aggte(cs_q, type="simple",  na.rm=TRUE)
+
+  att_val <- agg_simple$overall.att
+  att_se  <- agg_simple$overall.se
+  att_p   <- 2 * pnorm(-abs(att_val / att_se))
+  sig     <- case_when(att_p < 0.001 ~ "***",
+                       att_p < 0.01  ~ "**",
+                       att_p < 0.05  ~ "*",
+                       att_p < 0.10  ~ ".",
+                       TRUE          ~ "")
+
+  es_df <- tibble(
+    e   = agg_dyn$egt,
+    att = agg_dyn$att.egt,
+    se  = agg_dyn$se.egt
+  ) %>%
+    mutate(
+      periodo = ifelse(e < 0, "Pre", "Post"),
+      ic_low  = att - 1.96 * se,
+      ic_high = att + 1.96 * se
+    )
+
+  pct_pre_sig <- es_df %>%
+    filter(e < 0) %>%
+    mutate(p = 2 * pnorm(-abs(att / se))) %>%
+    summarise(pct = mean(p < 0.05, na.rm = TRUE) * 100) %>%
+    pull(pct)
+
+  subtitle_q <- sprintf("N=%d | Pré-trend: %.1f%% | ATT=%+.6f %s",
+                        n_mun, pct_pre_sig, att_val, sig)
+
+  plots[[q]] <- ggplot(es_df, aes(x=e, y=att, color=periodo)) +
+    geom_hline(yintercept=0, linetype="dashed",
+               linewidth=0.6, color="black") +
+    geom_vline(xintercept=-0.5, linetype="dotted",
+               linewidth=0.5, color="gray40") +
+    geom_errorbar(aes(ymin=ic_low, ymax=ic_high),
+                  width=0.4, linewidth=0.7) +
+    geom_point(size=2.5) +
+    scale_color_manual(values=c("Pre"="salmon","Post"="steelblue")) +
+    scale_x_continuous(breaks=seq(-12, 8, by=4)) +
+    labs(title    = labels_q[q],
+         subtitle = subtitle_q,
+         x = "Períodos relativos ao tratamento",
+         y = "ATT") +
+    theme_minimal(base_size=11) +
+    theme(plot.title     = element_text(face="bold", size=11),
+          plot.subtitle  = element_text(size=8, color="gray40"),
+          legend.position = "none",
+          panel.grid.minor = element_blank())
+}
+
+# Legenda compartilhada
+legenda <- get_legend(
+  ggplot(tibble(e=0, att=0, periodo=c("Pre","Post")),
+         aes(e, att, color=periodo)) +
+    geom_point() +
+    scale_color_manual(values = c("Pre"="salmon","Post"="steelblue"),
+                       labels = c("Pre"="Pré","Post"="Pós"),
+                       name   = NULL) +
+    theme_minimal() +
+    theme(legend.position="bottom")
+)
+
+painel <- plot_grid(plots[[1]], plots[[2]],
+                    plots[[3]], plots[[4]],
+                    ncol=2, align="hv")
+
+titulo_gg <- ggdraw() +
+  draw_label(titulo_figura, fontface="bold",
+             size=13, x=0.5, hjust=0.5)
+
+figura_final <- plot_grid(
+  titulo_gg,
+  plot_grid(painel, legenda, ncol=1, rel_heights=c(1, 0.06)),
+  ncol=1, rel_heights=c(0.04, 1)
+)
+
+ggsave(file.path(dir_output, nome_arquivo), figura_final,
+       width=12, height=9, dpi=300, bg="white")
+
+cat(sprintf("✅ Salvo: %s\n", file.path(dir_output, nome_arquivo)))
+```
+
+```{r diagnostico_pretrend_q3}
+
+# Verificar composição de cohorts em Q3 de PIB
+dados %>%
+  filter(quartil_pib == 3, gname != 2022) %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  print()
+
+# Verificar se há municípios tratados antes de 2014
+dados %>%
+  filter(quartil_pib == 3, gname != 2022, gname > 0) %>%
+  summarise(
+    primeiro_cohort = min(gname),
+    n_mun_2014      = sum(gname == 2014),
+    n_mun_2018      = sum(gname == 2018)
+  ) %>%
+  print()
+```
+
+```{r diagnostico_q3_pretrend_detalhado}
+
+# 1. Quantos pontos pré-tratamento existem para Q3?
+dados_q3 <- dados %>%
+  filter(quartil_pib == 3, gname != 2022)
+
+# Reusar especificação do modelo 3b via DIDparams
+params_3b <- resultados[["3b"]]$fit$DIDparams
+
+cs_q3 <- att_gt(
+  yname         = params_3b$yname,
+  tname         = params_3b$tname,
+  idname        = params_3b$idname,
+  gname         = params_3b$gname,
+  xformla       = params_3b$xformla,
+  data          = dados_q3,
+  control_group = "notyettreated",
+  est_method    = "dr",
+  base_period   = "universal",
+  anticipation  = 0,
+  print_details = FALSE
+)
+
+# 2. ATT(g,t) individuais — ver quais períodos pré são significativos
+att_df <- tibble(
+  group = cs_q3$group,
+  t     = cs_q3$t,
+  att   = cs_q3$att,
+  se    = cs_q3$se
+) %>%
+  filter(!is.na(se)) %>%
+  mutate(
+    p_valor   = 2 * pnorm(-abs(att / se)),
+    pre_post  = ifelse(t < group, "pré", "pós"),
+    sig       = p_valor < 0.05
+  ) %>%
+  arrange(group, t)
+
+cat("ATT(g,t) pré-tratamento para Q3:\n")
+print(att_df %>% filter(pre_post == "pré") %>%
+      select(group, t, att, se, p_valor, sig))
+
+# 3. Teste conjunto de pré-tendências
+agg_q3_dyn <- aggte(cs_q3, type = "dynamic", na.rm = TRUE)
+
+pre_periods <- tibble(
+  e   = agg_q3_dyn$egt,
+  att = agg_q3_dyn$att.egt,
+  se  = agg_q3_dyn$se.egt
+) %>% filter(e < 0, !is.na(se))
+
+cat(sprintf("\nPeríodos pré disponíveis: %d\n", nrow(pre_periods)))
+cat("Coeficientes pré-tratamento:\n")
+pre_periods %>%
+  mutate(p = 2 * pnorm(-abs(att / se)),
+         sig = p < 0.05) %>%
+  print()
+
+# 4. Comparar polarização baseline (2010) cohort 2014 vs controles em Q3
+cat("\nPolarização 2010 por cohort em Q3:\n")
+dados_q3 %>%
+  filter(ano == 2010) %>%
+  mutate(grupo = ifelse(gname == 2014, "Cohort 2014",
+                        ifelse(gname == 2018, "Cohort 2018",
+                               "Never-treated"))) %>%
+  group_by(grupo) %>%
+  summarise(
+    n        = n(),
+    er_mean  = mean(esteban_ray, na.rm = TRUE),
+    er_sd    = sd(esteban_ray,   na.rm = TRUE),
+    pib_mean = mean(pib_per_capita, na.rm = TRUE)
+  ) %>%
+  print()
+```
+
+
+# ============================================================================
+# TABELA DE ESTABILIDADE — modelos progressivos
+# ============================================================================
+
+```{r tabela_resultados}
+tabela_estab <- tibble(
+  Modelo = c(
+    "(1a) Sem PIB + erbs_per_1000hab - CS SIMPLE",
+    "(1a) Sem PIB + erbs_per_1000hab - CS DYNAMIC",
+    "(1b) Sem PIB + erbs_per_km2 - CS SIMPLE",
+    "(1b) Sem PIB + erbs_per_km2 - CS DYNAMIC",
+    "(2a) + PIB + erbs_per_1000hab - CS SIMPLE",
+    "(2a) + PIB + erbs_per_1000hab - CS DYNAMIC",
+    "(2b) + PIB + erbs_per_km2 - CS SIMPLE",
+    "(2b) + PIB + erbs_per_km2 - CS DYNAMIC",
+    "(3a) + PIB + Educação + erbs_per_1000hab - CS SIMPLE",
+    "(3a) + PIB + Educação + erbs_per_1000hab - CS DYNAMIC",
+    "(3b) + PIB + Educação + erbs_per_km2 - CS SIMPLE",
+    "(3b) + PIB + Educação + erbs_per_km2 - CS DYNAMIC",
+    "(4a) + PIB + Baixa instrução - CS SIMPLES",
+    "(4a) + PIB + Baixa instrução - CS DYNAMIC"
+  ),
+  xformla = c(
+    "anos_3g + erbs_per_1000hab",
+    "anos_3g + erbs_per_1000hab",
+    "anos_3g + erbs_per_km2",
+    "anos_3g + erbs_per_km2",
+    "anos_3g + erbs_per_1000hab + log_pib_pc",
+    "anos_3g + erbs_per_1000hab + log_pib_pc",
+    "anos_3g + erbs_per_km2 + log_pib_pc",
+    "anos_3g + erbs_per_km2 + log_pib_pc",
+    "anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais",
+    "anos_3g + erbs_per_1000hab + log_pib_pc + prop_medio_mais",
+    "anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais",
+    "anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais",
+    "anos_3g + erbs_per_1000hab + log_pib_pc + prop_baixa_instrucao",
+    "anos_3g + erbs_per_1000hab + log_pib_pc + prop_baixa_instrucao"
+  ),
+  ATT = c(
+    resultados[["1a"]]$simple$overall.att,
+    resultados[["1a"]]$dynamic$overall.att,
+    resultados[["1b"]]$simple$overall.att,
+    resultados[["1b"]]$dynamic$overall.att,
+    resultados[["2a"]]$simple$overall.att,
+    resultados[["2a"]]$dynamic$overall.att,
+    resultados[["2b"]]$simple$overall.att,
+    resultados[["2b"]]$dynamic$overall.att,
+    resultados[["3a"]]$simple$overall.att,
+    resultados[["3a"]]$dynamic$overall.att,
+    resultados[["3b"]]$simple$overall.att,
+    resultados[["3b"]]$dynamic$overall.att,
+    resultados[["4a"]]$simple$overall.att,
+    resultados[["4a"]]$dynamic$overall.att
+  ),
+  SE = c(
+    resultados[["1a"]]$simple$overall.se,
+    resultados[["1a"]]$dynamic$overall.se,
+    resultados[["1b"]]$simple$overall.se,
+    resultados[["1b"]]$dynamic$overall.se,
+    resultados[["2a"]]$simple$overall.se,
+    resultados[["2a"]]$dynamic$overall.se,
+    resultados[["2b"]]$simple$overall.se,
+    resultados[["2b"]]$dynamic$overall.se,
+    resultados[["3a"]]$simple$overall.se,
+    resultados[["3a"]]$dynamic$overall.se,
+    resultados[["3b"]]$simple$overall.se,
+    resultados[["3b"]]$dynamic$overall.se,
+    resultados[["4a"]]$simple$overall.se,
+    resultados[["4a"]]$dynamic$overall.se
+  )
+) %>%
+  mutate(
+    Pvalor = 2 * pnorm(-abs(ATT / SE)),
+    Sig    = case_when(
+               Pvalor < 0.01 ~ "***",
+               Pvalor < 0.05 ~ "**",
+               Pvalor < 0.10 ~ "*",
+               TRUE          ~ ""
+             )
+  )
+
+cat("\n====================================================\n")
+cat("TABELA DE ESTABILIDADE DO ATT\n")
+cat("====================================================\n\n")
+print(tabela_estab, digits = 6)
+```
+
+# salvar tabela
+
+```{r save_stability_table}
+# Salvar tabela de estabilidade
+tabela_path <- file.path(dir_output, "tabela_estabilidade_att_educacao.csv")
+write_csv(tabela_estab, tabela_path)
+cat(sprintf("✅ Salvo: %s\n", tabela_path))
+
+# Listar todos os arquivos gerados na pasta de saída
+cat(sprintf("\n📁 Arquivos em '%s':\n", dir_output))
+arquivos <- list.files(dir_output, full.names = FALSE)
+cat(paste0("   ", arquivos, collapse = "\n"), "\n")
+```

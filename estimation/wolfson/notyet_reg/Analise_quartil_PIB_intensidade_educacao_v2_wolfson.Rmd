@@ -1,0 +1,1327 @@
+---
+title: "Heterogeneidade por Quartil: PIB × Intensidade 4G × Educação"
+author: "Fabio de Medeiros"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 7,
+  dpi = 300
+)
+```
+
+```{r clean_env}
+rm(list = ls())
+gc()
+```
+
+# ============================================================================
+# Configuração inicial
+# ============================================================================
+
+```{r packages}
+library(tidyverse)
+library(did)
+library(cowplot)
+```
+
+```{r configurar_saida}
+# ── Pasta de saída ─────────────────────────────────────────────────────────
+# Altere aqui para redirecionar todos os resultados.
+dir_output <- "resultados_quartil"
+
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat(sprintf("✅ Pasta de saída: %s\n", normalizePath(dir_output)))
+```
+
+# ============================================================================
+# Passo 1: Carregar dados
+# ============================================================================
+
+```{r load_data}
+# Painel consolidado 2006–2022 (build_painel_consolidado.py). 5 períodos eleitorais.
+# Roda em estimation/ER_corr/; painel principal em estimation/ (ajuste o caminho
+# se o working directory do knit não for a subpasta).
+dados <- read_delim(
+  "../../../data/processed/painel_consolidado_2006_2022.csv",
+  delim = ",",
+  locale = locale(decimal_mark = ".", encoding = "UTF-8"),
+  col_types = cols(codigo_tse = col_character())
+)
+
+cat(sprintf("✅ Painel carregado: %d linhas | %d municípios | Anos: %s\n",
+            nrow(dados),
+            n_distinct(dados$codigo_tse),
+            paste(sort(unique(dados$ano)), collapse = ", ")))
+```
+
+```{r verificar_vars}
+vars_necessarias <- c("esteban_ray_corr", "wolfson", "dist_bipolar", "dalton", "reynal_querol",
+                      "tem_4g", "anos_3g", "erbs_per_km2", "erbs_per_1000hab",
+                      "log_pib_pc", "prop_medio_mais", "prop_baixa_instrucao",
+                      "codigo_tse", "ano", "bl_densidade_2010", "bl_densidade_2010_win")
+
+faltando <- setdiff(vars_necessarias, names(dados))
+if (length(faltando) > 0) stop("Variáveis faltando: ", paste(faltando, collapse = ", "))
+cat("✅ Todas as variáveis necessárias presentes\n")
+```
+
+# ============================================================================
+# Passo 2: ID numérico e gname (cohort de primeiro tratamento)
+# ============================================================================
+
+```{r id_gname}
+mapeamento_id <- dados %>%
+  distinct(codigo_tse) %>%
+  arrange(codigo_tse) %>%
+  mutate(id = row_number())
+
+dados <- dados %>%
+  left_join(mapeamento_id, by = "codigo_tse") %>%
+  group_by(id) %>%
+  arrange(id, ano) %>%
+  mutate(
+    primeiro_ano_4g = ifelse(any(tem_4g == 1), min(ano[tem_4g == 1]), 0),
+    gname           = ifelse(primeiro_ano_4g == 0, 0, primeiro_ano_4g),
+    nunca_teve_4g   = (gname == 0)
+  ) %>%
+  ungroup()
+
+cat("Distribuição de cohorts:\n")
+print(dados %>% distinct(id, gname) %>% count(gname) %>% arrange(gname))
+```
+
+# ============================================================================
+# Passo 3: Criar quartis (três dimensões)
+# ============================================================================
+
+```{r quartis_pib}
+# ── PIB: rank relativo dentro de cada ano ──────────────────────────────────
+# Captura variação cross-sectional sem confundir com tendência agregada de renda.
+dados <- dados %>%
+  group_by(ano) %>%
+  mutate(quartil_pib = ntile(pib_per_capita, 4)) %>%
+  ungroup()
+
+cat("Distribuição quartil_pib (2018):\n")
+print(dados %>% filter(ano == 2018) %>% count(quartil_pib))
+```
+
+```{r quartis_intensidade}
+# ── Intensidade 4G: cortes fixos no cohort dominante ──────────────────────
+# Evita distorção de calcular sobre o painel empilhado.
+# O cohort dominante define os cortes; os quartis são aplicados a todo o painel.
+ano_ref_int <- dados %>%
+  filter(!nunca_teve_4g) %>%
+  distinct(id, gname) %>%
+  count(gname) %>%
+  slice_max(n, n = 1) %>%
+  pull(gname)
+
+cat(sprintf("Ano de referência para intensidade 4G: %d\n", ano_ref_int))
+
+cortes_km2 <- dados %>%
+  filter(!nunca_teve_4g, erbs_per_km2 > 0, gname == ano_ref_int) %>%
+  pull(erbs_per_km2) %>%
+  quantile(probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+cat("Cortes erbs_per_km2:\n")
+print(cortes_km2)
+
+dados <- dados %>%
+  mutate(
+    quartil_intensidade = case_when(
+      nunca_teve_4g                              ~ 0L,
+      is.na(erbs_per_km2)                        ~ NA_integer_,
+      erbs_per_km2 <= cortes_km2["25%"]          ~ 1L,
+      erbs_per_km2 <= cortes_km2["50%"]          ~ 2L,
+      erbs_per_km2 <= cortes_km2["75%"]          ~ 3L,
+      TRUE                                       ~ 4L
+    )
+  )
+
+cat("Distribuição quartil_intensidade (todos os anos, tratados):\n")
+print(dados %>% filter(!nunca_teve_4g) %>% count(quartil_intensidade))
+```
+
+```{r quartis_intensidade_hab}
+# ── Intensidade 4G por habitante: cortes fixos no cohort dominante ────────────
+# Mesma metodologia do quartil por km², mas usando erbs_per_1000hab.
+# Mantém o mesmo ano_ref_int definido no chunk anterior.
+cortes_1000hab <- dados %>%
+  filter(!nunca_teve_4g, erbs_per_1000hab > 0, gname == ano_ref_int) %>%
+  pull(erbs_per_1000hab) %>%
+  quantile(probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+cat("Cortes erbs_per_1000hab:\n")
+print(cortes_1000hab)
+
+dados <- dados %>%
+  mutate(
+    quartil_intensidade_hab = case_when(
+      nunca_teve_4g                                  ~ 0L,
+      is.na(erbs_per_1000hab)                        ~ NA_integer_,
+      erbs_per_1000hab <= cortes_1000hab["25%"]      ~ 1L,
+      erbs_per_1000hab <= cortes_1000hab["50%"]      ~ 2L,
+      erbs_per_1000hab <= cortes_1000hab["75%"]      ~ 3L,
+      TRUE                                           ~ 4L
+    )
+  )
+
+cat("\nDistribuição quartil_intensidade_hab (todos os anos, tratados):\n")
+print(dados %>% filter(!nunca_teve_4g) %>% count(quartil_intensidade_hab))
+
+cat("\nCorrelação entre métricas de intensidade (2018, tratados):\n")
+print(
+  dados %>%
+    filter(ano == 2018, !nunca_teve_4g) %>%
+    summarise(cor = cor(quartil_intensidade, quartil_intensidade_hab,
+                        use = "complete.obs"))
+)
+```
+
+```{r quartis_educacao}
+# ── Educação: cortes fixos em 2010 (baseline pré-tratamento) ──────────────
+# Duas variáveis: prop_medio_mais (quanto mais alto, mais educado)
+#                 prop_baixa_instrucao (quanto mais alto, menos educado)
+# A simetria entre os dois serve como check de consistência interna.
+
+cortes_medio_mais <- dados %>%
+  filter(ano == 2010) %>%
+  pull(prop_medio_mais) %>%
+  quantile(probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+cortes_baixa_instr <- dados %>%
+  filter(ano == 2010) %>%
+  pull(prop_baixa_instrucao) %>%
+  quantile(probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+cat("Cortes prop_medio_mais (2010):\n"); print(cortes_medio_mais)
+cat("Cortes prop_baixa_instrucao (2010):\n"); print(cortes_baixa_instr)
+
+atribuir_q <- function(x, cortes) {
+  case_when(
+    is.na(x)               ~ NA_integer_,
+    x <= cortes["25%"]     ~ 1L,
+    x <= cortes["50%"]     ~ 2L,
+    x <= cortes["75%"]     ~ 3L,
+    TRUE                   ~ 4L
+  )
+}
+
+dados <- dados %>%
+  mutate(
+    quartil_medio_mais     = atribuir_q(prop_medio_mais,     cortes_medio_mais),
+    quartil_baixa_instrucao = atribuir_q(prop_baixa_instrucao, cortes_baixa_instr)
+  )
+
+cat("\nDistribuição quartil_medio_mais (2010):\n")
+print(dados %>% filter(ano == 2010) %>% count(quartil_medio_mais))
+
+cat("\nCheck de consistência (Q1 médio+ ↔ Q4 baixa instrução):\n")
+print(
+  dados %>%
+    filter(ano == 2010) %>%
+    count(quartil_medio_mais, quartil_baixa_instrucao) %>%
+    filter(quartil_medio_mais + quartil_baixa_instrucao == 5)
+)
+```
+
+# ============================================================================
+# Passo 4: Definir dimensões de subgrupo e modelos de referência
+# ============================================================================
+
+```{r definir_subgrupos_e_modelos}
+# ── Princípio de especificação ─────────────────────────────────────────────
+# O quartil define apenas a ESTRATIFICAÇÃO da amostra — separa os municípios
+# em subgrupos por nível de uma covariável pré-tratamento. A variável contínua
+# subjacente ainda varia dentro de cada estrato (ex.: em Q1 de PIB, o PIB
+# vai do mínimo até P25). Se essa variável for correlacionada com o timing de
+# adoção do 4G, omiti-la viola a hipótese de tendências paralelas condicionais
+# e joga variação explicativa para o erro (viés por variável omitida).
+#
+# Portanto, o modelo completo do staggered_v2 é mantido integralmente em todas
+# as dimensões. A única exceção é a dimensão "baixa instrução", onde
+# prop_baixa_instrucao substitui prop_medio_mais — as duas medem o mesmo
+# construto latente de escolaridade por vias opostas e sua inclusão conjunta
+# introduz colinearidade sem ganho informacional.
+#
+# Modelo completo de referência (staggered_v2):
+#   bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais
+# ─────────────────────────────────────────────────────────────────────────────
+subgrupo_specs <- list(
+
+  list(
+    id          = "pib",
+    label       = "PIB per capita",
+    var_quartil = "quartil_pib",
+    labels_q    = c("Q1 (Baixo)", "Q2 (Médio-baixo)", "Q3 (Médio-alto)", "Q4 (Alto)"),
+    # Modelo completo. log_pib_pc varia dentro de cada quartil (Q1 vai do mínimo
+    # ao P25) e é correlacionado com o timing de adoção — omiti-lo violaria
+    # tendências paralelas. A estratificação não elimina a necessidade do controle.
+    xformla     = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais
+  ),
+
+  list(
+    id          = "intensidade_km2",
+    label       = "Intensidade 4G (erbs/km²)",
+    var_quartil = "quartil_intensidade",
+    labels_q    = c("Q1 (Baixa)", "Q2 (Média-baixa)", "Q3 (Média-alta)", "Q4 (Alta)"),
+    # erbs_per_km2 é OMITIDO deliberadamente: a estratificação por quartil de
+    # intensidade já define a "dose" recebida por cada município. Incluir
+    # erbs_per_km2 na xformla condiciona na própria variável de dose dentro do
+    # subgrupo de dose — conditioning circular que parcializa exatamente a
+    # variação que queremos capturar. Os demais controles (PIB, educação,
+    # densidade, 3G) preservam a validade das tendências paralelas condicionais.
+    xformla     = ~ bl_densidade_2010_win + anos_3g + log_pib_pc + prop_medio_mais
+  ),
+
+  list(
+    id          = "intensidade_hab",
+    label       = "Intensidade 4G (erbs/1000hab)",
+    var_quartil = "quartil_intensidade_hab",
+    labels_q    = c("Q1 (Baixa)", "Q2 (Média-baixa)", "Q3 (Média-alta)", "Q4 (Alta)"),
+    # Mesmo princípio de intensidade_km2: erbs_per_1000hab define o quartil de
+    # dose e é omitido da xformla para evitar circular conditioning. Também se
+    # omite erbs_per_km2, que mede o mesmo construto por densidade geográfica.
+    # Controles restantes garantem tendências paralelas sem condicionar na dose.
+    xformla     = ~ bl_densidade_2010_win + anos_3g + log_pib_pc + prop_medio_mais
+  ),
+
+  list(
+    id          = "educacao",
+    label       = "Educação (prop. médio+)",
+    var_quartil = "quartil_medio_mais",
+    labels_q    = c("Q1 (Baixa)", "Q2 (Média-baixa)", "Q3 (Média-alta)", "Q4 (Alta)"),
+    # Modelo completo. prop_medio_mais varia dentro do quartil e é correlacionada
+    # com o timing de tratamento (municípios mais educados adotam 4G antes).
+    # Mantê-la como controle contínuo absorve essa variação intra-estrato.
+    xformla     = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais
+  ),
+
+  list(
+    id          = "baixa_instrucao",
+    label       = "Baixa instrução (prop. fund. incompleto)",
+    var_quartil = "quartil_baixa_instrucao",
+    labels_q    = c("Q1 (Baixa)", "Q2 (Média-baixa)", "Q3 (Média-alta)", "Q4 (Alta)"),
+    # prop_baixa_instrucao substitui prop_medio_mais: as duas variáveis medem
+    # escolaridade em sentidos opostos e são altamente colineares — incluir
+    # ambas não acrescenta informação e infla os erros padrão. Usa-se a variável
+    # que define o estrato (prop_baixa_instrucao) como controle contínuo intra-quartil.
+    xformla     = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_baixa_instrucao
+  )
+)
+```
+
+# ============================================================================
+# Passo 5: Função padronizada de estimação por quartil
+# ============================================================================
+
+```{r funcao_estimar_por_quartil}
+# ── estimar_por_quartil ────────────────────────────────────────────────────
+# Para cada valor Q1–Q4 da variável de subgrupo:
+#   1. Filtra os dados (com opção de excluir cohort problemático)
+#   2. Estima att_gt com a xformla do spec
+#   3. Calcula agregações simple e dynamic
+#   4. Produz painel de event studies (PNG)
+#   5. Salva tabela de ATT (CSV)
+#   6. Retorna lista com todos os objetos
+# ─────────────────────────────────────────────────────────────────────────────
+estimar_por_quartil <- function(spec, dados,
+                                 dir_output     = "resultados_quartil",
+                                 min_e = -8, max_e = 8) {
+
+  id_sg     <- spec$id
+  var_q     <- spec$var_quartil
+  labels_q  <- spec$labels_q
+
+  cat(sprintf("\n%s\nSUBGRUPO: %s  |  var: %s\n%s\n\n",
+              strrep("═", 70), spec$label, var_q, strrep("═", 70)))
+
+  # ── Loop sobre Q1–Q4 ────────────────────────────────────────────────────
+  plots_es    <- vector("list", 4)
+  tabela_rows <- vector("list", 4)
+
+  for (q in 1:4) {
+
+    cat(sprintf("  ─── Q%d: %s ───\n", q, labels_q[q]))
+
+    dados_q <- dados %>%
+      filter(.data[[var_q]] == q)
+
+    n_mun  <- n_distinct(dados_q$id)
+    n_trat <- n_distinct(dados_q$id[dados_q$gname > 0])
+    cat(sprintf("    N = %d municípios | Tratados = %d (%.0f%%)\n",
+                n_mun, n_trat, 100 * n_trat / n_mun))
+
+    # Cohorts disponíveis
+    cohorts_q <- dados_q %>% distinct(id, gname) %>% count(gname) %>%
+      filter(gname > 0)
+    cat(sprintf("    Cohorts: %s\n",
+                paste(sprintf("%d(n=%d)", cohorts_q$gname, cohorts_q$n), collapse = ", ")))
+
+    # ── att_gt ──────────────────────────────────────────────────────────
+    cs_q <- tryCatch(
+      att_gt(
+        yname         = "wolfson",
+        tname         = "ano",
+        idname        = "id",
+        gname         = "gname",
+        xformla       = spec$xformla,
+        data          = dados_q,
+        control_group = "notyettreated",
+        est_method    = "reg",
+        base_period   = "universal",
+        anticipation  = 0,
+        print_details = FALSE
+      ),
+      error = function(e) {
+        cat(sprintf("    ❌ ERRO: %s\n", e$message))
+        NULL
+      }
+    )
+
+    # Placeholder interno — reutilizado tanto se att_gt quanto se aggte falhar
+    placeholder_q <- function(motivo = "") {
+      if (nchar(motivo) > 0) cat(sprintf("    [aviso] Q%d ignorado: %s\n", q, motivo))
+      plots_es[[q]] <<- ggplot() +
+        annotate("text", x = 0, y = 0,
+                 label = sprintf("Q%d: estimação falhou", q),
+                 color = "gray50", size = 4) +
+        theme_void()
+      tabela_rows[[q]] <<- tibble(
+        subgrupo = spec$label, var_quartil = var_q, q = q,
+        label = labels_q[q], n_mun = n_mun, n_trat = n_trat,
+        att = NA_real_, se = NA_real_, p_valor = NA_real_, sig = NA_character_,
+        att_dyn = NA_real_, se_dyn = NA_real_, p_dyn = NA_real_
+      )
+    }
+
+    if (is.null(cs_q)) { placeholder_q(); next }
+
+    # ── Agregações (tryCatch cobre rowSums e outros erros internos) ───────
+    aggs <- tryCatch({
+      list(
+        s = aggte(cs_q, type = "simple",  na.rm = TRUE),
+        d = aggte(cs_q, type = "dynamic", na.rm = TRUE)
+      )
+    }, error = function(e) {
+      cat(sprintf("    ❌ aggte falhou: %s\n", e$message))
+      NULL
+    })
+
+    if (is.null(aggs)) { placeholder_q("aggte falhou"); next }
+
+    agg_s <- aggs$s;  agg_d <- aggs$d
+    att_s <- agg_s$overall.att;  se_s <- agg_s$overall.se
+    att_d <- agg_d$overall.att;  se_d <- agg_d$overall.se
+    p_s   <- 2 * pnorm(-abs(att_s / se_s))
+    p_d   <- 2 * pnorm(-abs(att_d / se_d))
+
+    sig_fn <- function(p) case_when(
+      p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", p < 0.10 ~ ".", TRUE ~ "ns"
+    )
+
+    cat(sprintf("    ATT simple  = %+.5f (SE=%.5f, p=%.4f %s)\n",
+                att_s, se_s, p_s, sig_fn(p_s)))
+    cat(sprintf("    ATT dynamic = %+.5f (SE=%.5f, p=%.4f %s)\n\n",
+                att_d, se_d, p_d, sig_fn(p_d)))
+
+    tabela_rows[[q]] <- tibble(
+      subgrupo    = spec$label,
+      var_quartil = var_q,
+      q           = q,
+      label       = labels_q[q],
+      n_mun       = n_mun,
+      n_trat      = n_trat,
+      att         = att_s,
+      se          = se_s,
+      p_valor     = p_s,
+      sig         = sig_fn(p_s),
+      att_dyn     = att_d,
+      se_dyn      = se_d,
+      p_dyn       = p_d
+    )
+
+    # ── Dados para event study ────────────────────────────────────────
+    es_df <- tibble(
+      e   = agg_d$egt,
+      att = agg_d$att.egt,
+      se  = agg_d$se.egt
+    ) %>%
+      filter(!is.na(se)) %>%
+      mutate(
+        periodo = ifelse(e < 0, "Pré", "Pós"),
+        ic_low  = att - 1.96 * se,
+        ic_high = att + 1.96 * se
+      )
+
+    pct_pre_sig <- es_df %>%
+      filter(e < 0) %>%
+      mutate(p = 2 * pnorm(-abs(att / se))) %>%
+      summarise(pct = mean(p < 0.05, na.rm = TRUE) * 100) %>%
+      pull(pct)
+
+    subtitulo <- sprintf("N=%d | Pré-trend sig.: %.0f%% | ATT=%+.5f %s",
+                         n_mun, pct_pre_sig, att_s, sig_fn(p_s))
+
+    plots_es[[q]] <- ggplot(es_df, aes(x = e, y = att, color = periodo)) +
+      geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6, color = "black") +
+      geom_vline(xintercept = -0.5, linetype = "dotted",
+                 linewidth = 0.5, color = "gray40") +
+      geom_errorbar(aes(ymin = ic_low, ymax = ic_high),
+                    width = 0.4, linewidth = 0.7) +
+      geom_point(size = 2.5) +
+      scale_color_manual(values = c("Pré" = "salmon", "Pós" = "steelblue")) +
+      scale_x_continuous(breaks = seq(min_e, max_e, by = 4)) +
+      labs(
+        title    = labels_q[q],
+        subtitle = subtitulo,
+        x = "Períodos relativos ao tratamento",
+        y = "ATT"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        plot.title      = element_text(face = "bold", size = 11),
+        plot.subtitle   = element_text(size = 8, color = "gray40"),
+        legend.position = "none",
+        panel.grid.minor = element_blank()
+      )
+  }   # fim loop Q1–Q4
+
+  # ── Painel de event studies ──────────────────────────────────────────────
+  legenda <- get_legend(
+    ggplot(tibble(e = 0, att = 0, periodo = c("Pré", "Pós")),
+           aes(e, att, color = periodo)) +
+      geom_point() +
+      scale_color_manual(values = c("Pré" = "salmon", "Pós" = "steelblue"),
+                         name = NULL) +
+      theme_minimal() + theme(legend.position = "bottom")
+  )
+
+  painel <- plot_grid(
+    plots_es[[1]], plots_es[[2]],
+    plots_es[[3]], plots_es[[4]],
+    ncol = 2, align = "hv"
+  )
+
+  titulo_gg <- ggdraw() +
+    draw_label(
+      sprintf("Event Study por Quartil — %s", spec$label),
+      fontface = "bold", size = 13, x = 0.5, hjust = 0.5
+    )
+
+  figura_es <- plot_grid(
+    titulo_gg,
+    plot_grid(painel, legenda, ncol = 1, rel_heights = c(1, 0.06)),
+    ncol = 1, rel_heights = c(0.04, 1)
+  )
+
+  fname_es <- file.path(dir_output, sprintf("event_study_quartil_%s.png", id_sg))
+  ggsave(fname_es, figura_es, width = 12, height = 9, dpi = 300, bg = "white")
+  cat(sprintf("  💾 Event study salvo: %s\n", fname_es))
+
+  # ── Tabela de ATT por quartil ─────────────────────────────────────────────
+  tabela_q <- bind_rows(tabela_rows)
+
+  fname_csv <- file.path(dir_output, sprintf("att_por_quartil_%s.csv", id_sg))
+  write_csv(tabela_q, fname_csv)
+  cat(sprintf("  💾 Tabela salva: %s\n", fname_csv))
+
+  # ── Barplot de ATT por quartil ────────────────────────────────────────────
+  p_bar <- tabela_q %>%
+    filter(!is.na(att)) %>%
+    mutate(
+      label_q  = factor(paste0("Q", q, "\n", str_remove(label, "Q\\d \\(")),
+                        levels = paste0("Q", 1:4, "\n",
+                                        str_remove(labels_q, "Q\\d \\("))),
+      ic_low   = att - 1.96 * se,
+      ic_high  = att + 1.96 * se,
+      sig_fill = p_valor < 0.05,
+      # vjust calculado dentro do mutate para evitar mismatch de tamanho no geom_text
+      vjust_lbl = ifelse(att < 0, 1.5, -1.2)
+    ) %>%
+    ggplot(aes(x = q, y = att, fill = sig_fill)) +
+    geom_col(width = 0.6, color = "gray30", linewidth = 0.3) +
+    geom_errorbar(aes(ymin = ic_low, ymax = ic_high),
+                  width = 0.25, linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%+.4f%s", att,
+                                  ifelse(p_valor < 0.05, "*", "")),
+                  vjust = vjust_lbl),
+              size = 3.5, fontface = "bold") +
+    scale_x_continuous(breaks = 1:4,
+                       labels = paste0("Q", 1:4, "\n", labels_q)) +
+    scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "gray70"),
+                      guide = "none") +
+    labs(
+      title    = sprintf("ATT por Quartil — %s", spec$label),
+      subtitle = "Barras azuis: p < 0.05  |  Intervalo de confiança 95%",
+      x        = spec$label,
+      y        = "ATT (Esteban-Ray)",
+      caption  = sprintf("Controles: %s",
+                         deparse(spec$xformla[[2]]))
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 9, color = "gray40"),
+      plot.caption  = element_text(size = 8, color = "gray50"),
+      panel.grid.major.x = element_blank()
+    )
+
+  fname_bar <- file.path(dir_output, sprintf("barplot_att_%s.png", id_sg))
+  ggsave(fname_bar, p_bar, width = 8, height = 5, dpi = 300, bg = "white")
+  cat(sprintf("  💾 Barplot salvo: %s\n\n", fname_bar))
+
+  invisible(list(
+    tabela = tabela_q,
+    plots  = plots_es
+  ))
+}
+```
+
+# ============================================================================
+# Passo 6: Estimação para cada dimensão de subgrupo
+# ============================================================================
+
+```{r estimar_subgrupos}
+# Executa a estimação para todas as dimensões definidas em subgrupo_specs.
+# Os resultados ficam armazenados em resultados_subgrupos[["<id>"]].
+resultados_subgrupos <- lapply(subgrupo_specs, estimar_por_quartil,
+                                dados      = dados,
+                                dir_output = dir_output)
+
+names(resultados_subgrupos) <- sapply(subgrupo_specs, `[[`, "id")
+
+cat(sprintf("✅ Estimações concluídas para %d dimensões: %s\n",
+            length(resultados_subgrupos),
+            paste(names(resultados_subgrupos), collapse = ", ")))
+```
+
+# ============================================================================
+# Passo 7: Tabela consolidada e visualização comparativa
+# ============================================================================
+
+```{r tabela_consolidada}
+# Reunir todos os resultados em uma única tabela
+tabela_geral <- bind_rows(
+  lapply(resultados_subgrupos, function(x) x$tabela)
+)
+
+cat("\n══════════════════════════════════════════════════════\n")
+cat("TABELA CONSOLIDADA — ATT por Quartil × Dimensão\n")
+cat("══════════════════════════════════════════════════════\n\n")
+
+tabela_geral %>%
+  select(subgrupo, q, label, n_mun, n_trat, att, se, p_valor, sig,
+         att_dyn, p_dyn) %>%
+  mutate(across(c(att, se, att_dyn), ~ round(.x, 6)),
+         across(c(p_valor, p_dyn),   ~ round(.x, 4))) %>%
+  print(n = 100)
+```
+
+```{r viz_comparativa}
+# ── Painel comparativo: ATT por quartil para as 4 dimensões ───────────────
+# Cada facet mostra uma dimensão; o eixo X é o quartil; a barra é o ATT.
+viz_comp <- tabela_geral %>%
+  filter(!is.na(att), !subgrupo %in% c("")) %>%
+  mutate(
+    ic_low  = att - 1.96 * se,
+    ic_high = att + 1.96 * se,
+    sig_fill = p_valor < 0.05,
+    # Label para eixo X mais enxuto
+    label_eixo = paste0("Q", q)
+  ) %>%
+  ggplot(aes(x = label_eixo, y = att, fill = sig_fill)) +
+  geom_col(width = 0.65, color = "gray30", linewidth = 0.3) +
+  geom_errorbar(aes(ymin = ic_low, ymax = ic_high),
+                width = 0.2, linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "gray70"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
+    name   = NULL
+  ) +
+  facet_wrap(~ subgrupo, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Efeito do 4G sobre Polarização por Quartil de Subgrupo",
+    subtitle = "ATT (Callaway-Sant'Anna) com IC 95% | Azul = significativo (p<0.05)",
+    x        = "Quartil",
+    y        = "ATT (Esteban-Ray)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, color = "gray40"),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.position  = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+fname_comp <- file.path(dir_output, "comparacao_att_subgrupos.png")
+ggsave(fname_comp, viz_comp, width = 12, height = 8, dpi = 300, bg = "white")
+cat(sprintf("💾 Painel comparativo salvo: %s\n", fname_comp))
+print(viz_comp)
+```
+
+```{r salvar_tabela_geral}
+fname_tab <- file.path(dir_output, "tabela_att_quartil_consolidada.csv")
+write_csv(tabela_geral, fname_tab)
+cat(sprintf("✅ Tabela consolidada salva: %s\n", fname_tab))
+
+# Inventário
+cat(sprintf("\n📁 Arquivos em '%s':\n", dir_output))
+cat(paste0("   ", list.files(dir_output), collapse = "\n"), "\n")
+```
+
+
+# ============================================================================
+# Passo 8: Heatmaps — Matrizes ATT (Dim. A × Dim. B)
+# ============================================================================
+# Cada heatmap mostra o ATT estimado para cada célula (Qa, Qb) de duas
+# dimensões cruzadas. As células com N abaixo do mínimo ficam em cinza.
+# A xformla de cada matriz usa os controles do baseline menos as duas
+# variáveis que definem os eixos da matriz.
+#
+# Ordem dos chunks:
+#   1. definir_matrizes  — especificações das 3 matrizes (o quê)
+#   2. funcao_heatmap    — funções estimar_celula e construir_e_plotar_heatmap (como)
+#   3. construir_heatmaps — execução
+#   4. inventario_final  — listagem de arquivos gerados
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r definir_matrizes}
+# ── Princípio de especificação das matrizes ────────────────────────────────
+# Cada matriz cruza dois quartis simultaneamente, criando células de ~100–250
+# municípios. O mesmo princípio da análise por subgrupo se aplica: as variáveis
+# de estratificação variam continuamente dentro de cada célula e devem ser
+# mantidas como controles para preservar a validade das tendências paralelas.
+#
+# Tensão prática: com células pequenas e poucos tratados por célula, modelos
+# com muitos parâmetros aumentam o risco de falha numérica no att_gt. Por isso,
+# adota-se o modelo completo sempre que as duas variáveis de estratificação são
+# distintas (sem colinearidade estrutural entre elas), e um modelo levemente
+# reduzido apenas quando as duas variáveis medem o mesmo construto.
+#
+# Modelo completo de referência:
+#   bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais
+# ─────────────────────────────────────────────────────────────────────────────
+matriz_specs <- list(
+
+  list(
+    id_matriz  = "intensidade_x_pib",
+    var_lin    = "quartil_intensidade",
+    var_col    = "quartil_pib",
+    label_lin  = "Intensidade 4G (erbs/km\u00b2)",
+    label_col  = "PIB per capita",
+    labels_lin = c("Baixa", "M\u00e9dia-baixa", "M\u00e9dia-alta", "Alta"),
+    labels_col = c("Baixo", "M\u00e9dio-baixo", "M\u00e9dio-alto", "Alto"),
+    # erbs_per_km2 omitido: define o eixo de intensidade (dose) — incluí-lo
+    # seria circular conditioning dentro de células definidas pela própria dose.
+    # log_pib_pc e prop_medio_mais permanecem: são confundidores/modificadores,
+    # não a dose, e sua variação intra-célula é necessária para tendências paralelas.
+    xformla    = ~ bl_densidade_2010_win + anos_3g + log_pib_pc + prop_medio_mais,
+    # INTENSIDADE: não excluir 2022 → 2022 vira controle not-yet-treated em t=2018,
+    # tornando a matriz capaz de enxergar o efeito de 2018 (sem isso, só ATT(2014,2014)).
+    excluir_cohort = NA
+  ),
+
+  list(
+    id_matriz  = "pib_x_educacao",
+    var_lin    = "quartil_pib",
+    var_col    = "quartil_medio_mais",
+    label_lin  = "PIB per capita",
+    label_col  = "Educa\u00e7\u00e3o (prop. m\u00e9dio+)",
+    labels_lin = c("Baixo", "M\u00e9dio-baixo", "M\u00e9dio-alto", "Alto"),
+    labels_col = c("Baixa", "M\u00e9dia-baixa", "M\u00e9dia-alta", "Alta"),
+    # Modelo completo: renda e educação são dimensões conceitualmente distintas
+    # e sua correlação empírica não justifica a exclusão de nenhuma das duas.
+    # A variação intra-célula em ambas as dimensões requer controle explícito.
+    xformla    = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais,
+    # PIB×Educ contém never-treated nas células → t=2018 já é identificado;
+    # excluir 2022 evita a contaminação do choque eleitoral.
+    excluir_cohort = 2022
+  ),
+
+  list(
+    id_matriz  = "intensidade_x_educacao",
+    var_lin    = "quartil_intensidade",
+    var_col    = "quartil_medio_mais",
+    label_lin  = "Intensidade 4G (erbs/km\u00b2)",
+    label_col  = "Educa\u00e7\u00e3o (prop. m\u00e9dio+)",
+    labels_lin = c("Baixa", "M\u00e9dia-baixa", "M\u00e9dia-alta", "Alta"),
+    labels_col = c("Baixa", "M\u00e9dia-baixa", "M\u00e9dia-alta", "Alta"),
+    # erbs_per_km2 omitido: circular conditioning no eixo de intensidade (dose).
+    # log_pib_pc e prop_medio_mais permanecem: confundidores/modificadores cuja
+    # variação intra-célula é necessária para tendências paralelas condicionais.
+    xformla    = ~ bl_densidade_2010_win + anos_3g + log_pib_pc + prop_medio_mais,
+    # INTENSIDADE: não excluir 2022 (mesmo motivo da matriz intensidade×PIB).
+    excluir_cohort = NA
+  )
+)
+
+cat(sprintf("✅ %d matrizes definidas: %s\n",
+            length(matriz_specs),
+            paste(sapply(matriz_specs, `[[`, "id_matriz"), collapse = ", ")))
+```
+
+```{r funcao_heatmap}
+# ── Estima ATT para uma célula (q_lin × q_col) ────────────────────────────
+estimar_celula <- function(dados, q_lin, q_col,
+                            var_lin, var_col,
+                            xformla) {
+
+  dados_cel <- dados %>%
+    filter(.data[[var_lin]] == q_lin,
+           .data[[var_col]] == q_col)
+
+  n_mun  <- n_distinct(dados_cel$id)
+  n_trat <- n_distinct(dados_cel$id[dados_cel$gname > 0])
+  n_ctrl <- n_distinct(dados_cel$id[dados_cel$gname == 0])
+
+  # ── Critério de controles mínimos ────────────────────────────────────────
+  # O painel é eleitoral (2010, 2014, 2018, 2022) com apenas 3 cohorts:
+  # 2014, 2018 e 2022. Municípios "nunca tratados" (gname == 0) existem no
+  # painel global (65 municípios), mas NÃO aparecem em células de intensidade
+  # (quartil_intensidade é 0 para não tratados → ficam fora dos Q1–Q4).
+  #
+  # Por isso o critério de controle usa o número de cohorts DISTINTOS dentro
+  # da célula: o CS estimador usa "not yet treated" — cohort 2018 serve de
+  # controle para cohort 2014 em t=2010. Sem variação de cohort não há
+  # contrafactual possível. Exige-se ao menos 2 cohorts distintos E ao menos
+  # 10 municípios no cohort mais tardio (controles "de facto" para o mais cedo).
+  cohorts_cel <- unique(dados_cel$gname[dados_cel$gname > 0])
+  n_cohorts   <- length(cohorts_cel)
+  # Municípios no cohort mais tardio = principais controles not-yet-treated
+  n_ctrl_nyt  <- if (n_cohorts >= 2) {
+    n_distinct(dados_cel$id[dados_cel$gname == max(cohorts_cel)])
+  } else 0L
+
+  if (n_cohorts < 2 || n_ctrl_nyt < 10) {
+    motivo_ctrl <- if (n_cohorts < 2) "cohort_unico" else "ctrl_insuf"
+    message(sprintf(
+      "    [%s] célula (%d,%d): %d cohort(s), %d controles nyt",
+      motivo_ctrl, q_lin, q_col, n_cohorts, n_ctrl_nyt
+    ))
+    return(tibble(q_lin = q_lin, q_col = q_col,
+                  n_mun = n_mun, n_trat = n_trat, n_ctrl = n_ctrl,
+                  att = NA_real_, se = NA_real_, p_valor = NA_real_,
+                  sucesso = FALSE, motivo = motivo_ctrl))
+  }
+
+  # tryCatch cobre att_gt + aggte juntos: qualquer falha (inclusive rowSums em
+  # células com cohorts insuficientes) retorna sucesso = FALSE sem travar o loop.
+  tryCatch({
+
+    cs <- att_gt(
+      yname         = "wolfson",
+      tname         = "ano",
+      idname        = "id",
+      gname         = "gname",
+      xformla       = xformla,
+      data          = dados_cel,
+      control_group = "notyettreated",
+      est_method    = "reg",
+      base_period   = "universal",
+      anticipation  = 0,
+      print_details = FALSE
+    )
+
+    # bstrap = FALSE: usa SE analítico em vez de bootstrap. O bootstrap do CS
+    # pode causar hard crash (C++ abort) em células pequenas com poucos cohorts
+    # — o processo R morre antes de qualquer tryCatch poder agir, truncando o
+    # write_csv. SE analítico é menos preciso mas numericamente estável.
+    agg <- aggte(cs, type = "simple", na.rm = TRUE,
+                 bstrap = FALSE, cband = FALSE)
+    att <- agg$overall.att
+    se  <- agg$overall.se
+
+    if (!is.finite(se) || !is.finite(att))
+      stop(sprintf("aggte retornou se/att inválido: att=%s se=%s", att, se))
+
+    p   <- 2 * pnorm(-abs(att / se))
+
+    tibble(q_lin = q_lin, q_col = q_col,
+           n_mun = n_mun, n_trat = n_trat, n_ctrl = n_ctrl,
+           att = att, se = se, p_valor = p,
+           sucesso = TRUE, motivo = "ok")
+
+  }, error = function(e) {
+    message(sprintf("    [aviso] célula (%d,%d) falhou: %s",
+                    q_lin, q_col, conditionMessage(e)))
+    tibble(q_lin = q_lin, q_col = q_col,
+           n_mun = n_mun, n_trat = n_trat, n_ctrl = n_ctrl,
+           att = NA_real_, se = NA_real_, p_valor = NA_real_,
+           sucesso = FALSE, motivo = "erro_estimacao")
+  })
+}
+
+# ── Constrói a matriz completa e plota o heatmap ──────────────────────────
+construir_e_plotar_heatmap <- function(dados,
+                                        var_lin, var_col,
+                                        label_lin, label_col,
+                                        labels_lin, labels_col,
+                                        xformla,
+                                        id_matriz,
+                                        dir_output,
+                                        n_min          = 80,
+                                        excluir_cohort = 2022) {
+  # excluir_cohort: cohort a remover das células (default 2022, contaminado pelo
+  #   choque eleitoral). IMPORTANTE p/ matrizes de INTENSIDADE: as células de
+  #   intensidade não contêm never-treated; excluindo 2022, o único ATT(g,t)
+  #   identificável é ATT(2014,2014) → a matriz fica CEGA a 2018. Para enxergar
+  #   2018, chame estas matrizes com excluir_cohort = NA (mantém 2022 como
+  #   controle not-yet-treated em t=2018).
+
+  cat(sprintf("\n%s\nMATRIZ: %s \u00d7 %s\n%s\n\n",
+              strrep("\u2550", 60), label_lin, label_col, strrep("\u2550", 60)))
+
+  # ── Estimar todas as células 4 × 4 ─────────────────────────────────────
+  # For loop explícito em vez de pmap_dfr: acumula tibbles individualmente e
+  # aplica bind_rows só no final, evitando corrupção de tipos durante binding
+  # incremental (problema quando aggte retorna NaN sem lançar erro).
+  lista_cel <- vector("list", 16L)
+  idx <- 0L
+
+  for (ql in 1:4) {
+    for (qc in 1:4) {
+      idx <- idx + 1L
+      cat(sprintf("  Célula (%d, %d)... ", ql, qc))
+
+      res <- tryCatch(
+        estimar_celula(dados, ql, qc,
+                       var_lin, var_col, xformla,
+                       excluir_cohort = excluir_cohort),
+        error = function(e) {
+          message(sprintf("    [ERRO EXTERNO] célula (%d,%d): %s",
+                          ql, qc, conditionMessage(e)))
+          tibble(q_lin = ql, q_col = qc,
+                 n_mun = NA_integer_, n_trat = NA_integer_, n_ctrl = NA_integer_,
+                 att = NA_real_, se = NA_real_, p_valor = NA_real_,
+                 sucesso = FALSE, motivo = "erro_externo")
+        }
+      )
+
+      # Normalizar tipos antes de guardar na lista: garante colunas consistentes
+      # independente do path de retorno (ok / ctrl_insuf / erro_*)
+      res$sucesso <- as.logical(res$sucesso)
+      res$motivo  <- as.character(res$motivo)
+      res$att     <- as.numeric(res$att)
+      res$se      <- as.numeric(res$se)
+      res$p_valor <- as.numeric(res$p_valor)
+
+      lista_cel[[idx]] <- res
+
+      cat(sprintf("N=%s | ATT=%s\n",
+                  ifelse(is.na(res$n_mun), "?", res$n_mun),
+                  ifelse(isTRUE(res$sucesso), sprintf("%+.5f", res$att), "FALHOU")))
+    }
+  }
+
+  resultados_cel <- bind_rows(lista_cel)
+
+  # Salvar CSV da matriz
+  fname_csv <- file.path(dir_output, sprintf("matriz_att_%s.csv", id_matriz))
+  write_csv(resultados_cel, fname_csv)
+  cat(sprintf("\n💾 Matriz salva: %s\n", fname_csv))
+
+  # ── Preparar dados para o heatmap ──────────────────────────────────────
+  sig_fn <- function(p) case_when(
+    is.na(p)    ~ "",
+    p < 0.001   ~ "***",
+    p < 0.01    ~ "**",
+    p < 0.05    ~ "*",
+    p < 0.10    ~ ".",
+    TRUE        ~ ""
+  )
+
+  hm_data <- resultados_cel %>%
+    mutate(
+      # Célula válida: N total suficiente, controles suficientes e estimação ok
+      valida     = n_mun >= n_min & sucesso,
+      att_plot   = ifelse(valida, att,     NA_real_),
+      p_plot     = ifelse(valida, p_valor, NA_real_),
+      sig        = sig_fn(p_plot),
+      # Rótulo diferenciado por motivo de exclusão:
+      #   "N=X (insuf.)"      → N total abaixo do mínimo
+      #   "1 cohort"          → único cohort na célula (sem contrafactual)
+      #   "ctrl=X (<10)"      → cohort mais tardio tem < 10 municípios (nyt insuf.)
+      #   "falhou"            → erro numérico na estimação
+      #   valor + estrelas    → estimação válida
+      label_cel  = case_when(
+        n_mun < n_min                           ~ sprintf("N=%d\n(insuf.)", n_mun),
+        !sucesso & motivo == "cohort_unico"     ~ "1 cohort\n(sem ctrl)",
+        !sucesso & motivo == "ctrl_insuf"       ~ sprintf("ctrl=%d\n(<10)", n_ctrl),
+        !sucesso & motivo == "erro_externo"     ~ "erro\n(externo)",
+        !sucesso                                ~ "falhou",
+        TRUE                                    ~ sprintf("%+.4f%s\n(n=%d)", att, sig, n_mun)
+      ),
+      # Inverter eixo lin para Q4 no topo
+      f_lin = factor(q_lin, levels = 4:1,
+                     labels = rev(paste0("Q", 4:1, "\n", labels_lin))),
+      f_col = factor(q_col, levels = 1:4,
+                     labels = paste0("Q", 1:4, "\n", labels_col))
+    )
+
+  # ── Heatmap ────────────────────────────────────────────────────────────
+  limite_abs <- max(abs(hm_data$att_plot), na.rm = TRUE) * 1.05
+
+  p_hm <- ggplot(hm_data, aes(x = f_col, y = f_lin)) +
+
+    geom_tile(aes(fill = att_plot),
+              color = "white", linewidth = 1.2) +
+
+    # Borda preta em células significativas (p < 0.05)
+    geom_tile(data = filter(hm_data, !is.na(p_plot) & p_plot < 0.05),
+              aes(x = f_col, y = f_lin),
+              fill = NA, color = "black", linewidth = 1.1) +
+
+    geom_text(aes(label = label_cel,
+                  color = ifelse(is.na(att_plot), "gray40",
+                                 ifelse(abs(att_plot) > 0.6 * limite_abs,
+                                        "white", "gray20"))),
+              size = 3.5, lineheight = 0.9, fontface = "bold") +
+
+    scale_fill_gradient2(
+      low      = "#2166ac",   # azul  — reduz polarização
+      mid      = "white",
+      high     = "#d6604d",   # vermelho — aumenta polarização
+      midpoint = 0,
+      na.value = "gray88",
+      limits   = c(-limite_abs, limite_abs),
+      name     = "ATT\n(Esteban-Ray)"
+    ) +
+    scale_color_identity() +
+
+    labs(
+      title    = sprintf("Matriz ATT: %s \u00d7 %s", label_lin, label_col),
+      subtitle = sprintf(
+        "ATT Callaway-Sant'Anna (simple) | Borda preta = p<0.05 | Cinza = N<%d, ctrl<15%% ou falha\nControles: %s",
+        n_min, deparse(xformla[[2]])
+      ),
+      x = sprintf("\u2190 %s \u2192", label_col),
+      y = sprintf("\u2190 %s \u2192", label_lin)
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 14),
+      plot.subtitle     = element_text(size = 8.5, color = "gray40",
+                                       margin = margin(b = 8)),
+      axis.title        = element_text(face = "bold", size = 11),
+      axis.text         = element_text(size = 10),
+      legend.position   = "right",
+      legend.key.height = unit(1.5, "cm"),
+      panel.grid        = element_blank()
+    )
+
+  fname_hm <- file.path(dir_output, sprintf("heatmap_%s.png", id_matriz))
+  ggsave(fname_hm, p_hm, width = 10, height = 8, dpi = 300, bg = "white")
+  cat(sprintf("💾 Heatmap salvo: %s\n\n", fname_hm))
+  print(p_hm)
+
+  invisible(list(dados = resultados_cel, plot = p_hm))
+}
+```
+
+```{r construir_heatmaps}
+# Executa as 3 matrizes definidas em matriz_specs.
+# Cada chamada estima 16 células (4 × 4), salva CSV e PNG.
+resultados_matrizes <- lapply(matriz_specs, function(ms) {
+  construir_e_plotar_heatmap(
+    dados          = dados,
+    var_lin        = ms$var_lin,
+    var_col        = ms$var_col,
+    label_lin      = ms$label_lin,
+    label_col      = ms$label_col,
+    labels_lin     = ms$labels_lin,
+    labels_col     = ms$labels_col,
+    xformla        = ms$xformla,
+    id_matriz      = ms$id_matriz,
+    dir_output     = dir_output,
+    n_min          = 80,
+    excluir_cohort = ms$excluir_cohort
+  )
+})
+
+names(resultados_matrizes) <- sapply(matriz_specs, `[[`, "id_matriz")
+cat("✅ Todos os heatmaps construídos.\n")
+```
+
+```{r inventario_final}
+cat(sprintf("\n📁 Arquivos finais em '%s':\n", dir_output))
+arqs <- list.files(dir_output)
+cat(paste0("   ", arqs, collapse = "\n"), "\n")
+cat(sprintf("\nTotal: %d arquivos\n", length(arqs)))
+```
+
+# ============================================================================
+# Passo 9: Diagnóstico da célula outlier — PIB Q2 (Médio-alto) × Educ Q1 (Baixa)
+# ============================================================================
+# ATT estimado = +0.1576*** (N=232), magnitude ~10× maior que qualquer outra
+# célula. Investigação em quatro passos:
+#   1. Distribuição de cohorts       — instabilidade amostral?
+#   2. Série temporal bruta          — tendências paralelas visualmente?
+#   3. Event study formal            — pré-tendências no estimador CS?
+#   4. Perfil geográfico             — concentração regional / choque local?
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r diag_isolar_celula}
+# ── Isolar a amostra da célula ────────────────────────────────────────────
+dados_cel_diag <- dados %>%
+  filter(quartil_pib == 2,
+         quartil_medio_mais == 1,
+         gname != 2022)          # mesma exclusão usada na estimação
+
+n_cel    <- n_distinct(dados_cel_diag$id)
+n_trat   <- n_distinct(dados_cel_diag$id[dados_cel_diag$gname > 0])
+n_ctrl   <- n_distinct(dados_cel_diag$id[dados_cel_diag$gname == 0])
+
+cat(sprintf("Célula: PIB Q2 × Educação Q1\n"))
+cat(sprintf("  Municípios total : %d\n", n_cel))
+cat(sprintf("  Tratados         : %d\n", n_trat))
+cat(sprintf("  Controles        : %d\n\n", n_ctrl))
+```
+
+```{r diag_cohorts}
+# ── Passo 1: Distribuição de cohorts ─────────────────────────────────────
+# Poucos municípios por cohort → alta variância → ATT instável.
+cohorts_cel <- dados_cel_diag %>%
+  distinct(id, gname) %>%
+  count(gname, name = "n_mun") %>%
+  arrange(gname) %>%
+  mutate(pct = round(100 * n_mun / sum(n_mun[gname > 0]), 1),
+         tipo = ifelse(gname == 0, "Controle (nunca tratado)", "Tratado"))
+
+cat("Distribuição por cohort:\n")
+print(cohorts_cel, n = 30)
+
+# Sinalizar cohorts com N pequeno (< 20 municípios)
+cohorts_pequenos <- cohorts_cel %>% filter(gname > 0, n_mun < 20)
+if (nrow(cohorts_pequenos) > 0) {
+  cat(sprintf(
+    "\n⚠️  %d cohort(s) com menos de 20 municípios: %s\n",
+    nrow(cohorts_pequenos),
+    paste(cohorts_pequenos$gname, collapse = ", ")
+  ))
+} else {
+  cat("\n✅ Todos os cohorts têm N ≥ 20.\n")
+}
+```
+
+```{r diag_serie_temporal}
+# ── Passo 2: Série temporal bruta do Esteban-Ray ─────────────────────────
+# Comparação visual sem modelo: se as séries divergem antes do tratamento,
+# a hipótese de tendências paralelas não se sustenta nessa célula.
+# "Tratado" = municípios com gname > 0; "Controle" = gname == 0.
+serie_cel <- dados_cel_diag %>%
+  mutate(grupo = ifelse(gname > 0, "Tratado", "Controle (nunca tratado)")) %>%
+  group_by(ano, grupo) %>%
+  summarise(er_medio = mean(wolfson, na.rm = TRUE),
+            er_sd    = sd(wolfson,   na.rm = TRUE),
+            n        = n(),
+            .groups  = "drop") %>%
+  mutate(ic_low  = er_medio - 1.96 * er_sd / sqrt(n),
+         ic_high = er_medio + 1.96 * er_sd / sqrt(n))
+
+p_serie <- ggplot(serie_cel, aes(x = ano, y = er_medio,
+                                  color = grupo, fill = grupo)) +
+  geom_ribbon(aes(ymin = ic_low, ymax = ic_high), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Tratado" = "steelblue",
+                                "Controle (nunca tratado)" = "tomato")) +
+  scale_fill_manual(values  = c("Tratado" = "steelblue",
+                                "Controle (nunca tratado)" = "tomato")) +
+  scale_x_continuous(breaks = sort(unique(dados$ano))) +
+  labs(
+    title    = "Série temporal bruta — PIB Q2 × Educação Q1",
+    subtitle = "Esteban-Ray médio (IC 95%) | Tratados vs. controles (nunca tratados)",
+    x        = "Ano",
+    y        = "Esteban-Ray (média)",
+    color    = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(file.path(dir_output, "diag_serie_pib2_educ1.png"),
+       p_serie, width = 10, height = 5, dpi = 300, bg = "white")
+print(p_serie)
+```
+
+```{r diag_event_study}
+# ── Passo 3: Event study formal (Callaway-Sant'Anna) ─────────────────────
+# Pré-tendências planas = identificação válida.
+# Pré-tendências com oscilação grande = ATT não confiável.
+cs_diag <- tryCatch(
+  att_gt(
+    yname         = "wolfson",
+    tname         = "ano",
+    idname        = "id",
+    gname         = "gname",
+    xformla       = ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 +
+                      log_pib_pc + prop_medio_mais,
+    data          = dados_cel_diag,
+    control_group = "notyettreated",
+    est_method    = "reg",
+    base_period   = "universal",
+    anticipation  = 0,
+    print_details = FALSE
+  ),
+  error = function(e) { cat("❌ att_gt falhou:", e$message, "\n"); NULL }
+)
+
+if (!is.null(cs_diag)) {
+
+  agg_diag_s <- aggte(cs_diag, type = "simple",  na.rm = TRUE)
+  agg_diag_d <- aggte(cs_diag, type = "dynamic", na.rm = TRUE)
+
+  cat(sprintf("ATT simple  = %+.5f (SE=%.5f, p=%.6f)\n",
+              agg_diag_s$overall.att, agg_diag_s$overall.se,
+              2 * pnorm(-abs(agg_diag_s$overall.att / agg_diag_s$overall.se))))
+  cat(sprintf("ATT dynamic = %+.5f (SE=%.5f, p=%.6f)\n\n",
+              agg_diag_d$overall.att, agg_diag_d$overall.se,
+              2 * pnorm(-abs(agg_diag_d$overall.att / agg_diag_d$overall.se))))
+
+  # Dados do event study
+  es_diag <- tibble(
+    e       = agg_diag_d$egt,
+    att     = agg_diag_d$att.egt,
+    se      = agg_diag_d$se.egt
+  ) %>%
+    filter(!is.na(se)) %>%
+    mutate(
+      periodo = ifelse(e < 0, "Pré", "Pós"),
+      ic_low  = att - 1.96 * se,
+      ic_high = att + 1.96 * se,
+      p_val   = 2 * pnorm(-abs(att / se)),
+      sig     = p_val < 0.05
+    )
+
+  # Estatística de pré-tendência
+  pre_sig_pct <- es_diag %>%
+    filter(e < 0) %>%
+    summarise(pct = mean(sig) * 100) %>%
+    pull(pct)
+
+  cat(sprintf("Períodos pré-tratamento com p<0.05: %.0f%%\n", pre_sig_pct))
+  if (pre_sig_pct > 30)
+    cat("⚠️  Pré-tendências potencialmente problemáticas.\n")
+  else
+    cat("✅ Pré-tendências aparentemente planas.\n")
+
+  p_es_diag <- ggplot(es_diag, aes(x = e, y = att, color = periodo)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6) +
+    geom_vline(xintercept = -0.5, linetype = "dotted",
+               linewidth = 0.5, color = "gray40") +
+    geom_errorbar(aes(ymin = ic_low, ymax = ic_high),
+                  width = 0.4, linewidth = 0.7) +
+    geom_point(size = 3) +
+    # Destacar períodos pós-tratamento significativos
+    geom_point(data = filter(es_diag, e >= 0 & sig),
+               shape = 8, size = 4, color = "black") +
+    scale_color_manual(values = c("Pré" = "salmon", "Pós" = "steelblue")) +
+    scale_x_continuous(breaks = es_diag$e) +
+    labs(
+      title    = "Event Study — PIB Q2 (Médio-alto) × Educação Q1 (Baixa)",
+      subtitle = sprintf(
+        "ATT simple = %+.4f | Pré-tend. sig.: %.0f%% | N=%d",
+        agg_diag_s$overall.att, pre_sig_pct, n_cel
+      ),
+      x = "Períodos relativos ao tratamento",
+      y = "ATT",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold"),
+      legend.position  = "bottom",
+      panel.grid.minor = element_blank()
+    )
+
+  ggsave(file.path(dir_output, "diag_event_study_pib2_educ1.png"),
+         p_es_diag, width = 10, height = 6, dpi = 300, bg = "white")
+  print(p_es_diag)
+}
+```
+
+```{r diag_perfil_geografico}
+# ── Passo 4: Perfil geográfico ────────────────────────────────────────────
+# Concentração em um único estado/região indica choque local não controlado.
+# Requer a variável de UF no painel — ajuste o nome se necessário.
+vars_geo <- c("uf", "estado", "sigla_uf", "cod_uf", "regiao")
+var_uf   <- intersect(vars_geo, names(dados_cel_diag))[1]
+
+if (!is.na(var_uf)) {
+
+  perfil_uf <- dados_cel_diag %>%
+    filter(ano == min(ano)) %>%                 # uma linha por município
+    distinct(id, .keep_all = TRUE) %>%
+    count(.data[[var_uf]], name = "n_mun") %>%
+    arrange(desc(n_mun)) %>%
+    mutate(pct = round(100 * n_mun / sum(n_mun), 1))
+
+  cat(sprintf("Distribuição por UF (var: %s):\n", var_uf))
+  print(perfil_uf, n = 30)
+
+  # Sinalizar concentração excessiva
+  max_pct <- max(perfil_uf$pct)
+  if (max_pct > 40)
+    cat(sprintf("\n⚠️  %.0f%% dos municípios concentrados em uma UF — ",
+                max_pct),
+        "possível choque regional não controlado.\n")
+  else
+    cat("\n✅ Distribuição geográfica relativamente dispersa.\n")
+
+} else {
+  cat("ℹ️  Nenhuma variável de UF identificada no painel.\n")
+  cat("   Adicione 'uf' (ou equivalente) ao dataset para este diagnóstico.\n\n")
+
+  # Alternativa: distribuição do Esteban-Ray dentro da célula
+  cat("Estatísticas descritivas do Esteban-Ray na célula (ano mais recente):\n")
+  dados_cel_diag %>%
+    filter(ano == max(ano)) %>%
+    summarise(
+      n     = n(),
+      media = mean(wolfson, na.rm = TRUE),
+      dp    = sd(wolfson,   na.rm = TRUE),
+      min   = min(wolfson,  na.rm = TRUE),
+      p25   = quantile(wolfson, 0.25, na.rm = TRUE),
+      p50   = quantile(wolfson, 0.50, na.rm = TRUE),
+      p75   = quantile(wolfson, 0.75, na.rm = TRUE),
+      max   = max(wolfson,  na.rm = TRUE)
+    ) %>%
+    print()
+}
+
+# ── Distribuição do Esteban-Ray na célula vs. restante do painel ──────────
+er_comp <- dados %>%
+  filter(ano == max(ano)) %>%
+  mutate(celula = ifelse(quartil_pib == 2 & quartil_medio_mais == 1,
+                         "PIB Q2 × Educ Q1", "Demais municípios")) %>%
+  group_by(celula) %>%
+  summarise(
+    n     = n(),
+    media = round(mean(wolfson, na.rm = TRUE), 5),
+    dp    = round(sd(wolfson,   na.rm = TRUE), 5),
+    p50   = round(median(wolfson, na.rm = TRUE), 5),
+    .groups = "drop"
+  )
+
+cat("\nComparação Esteban-Ray (ano mais recente):\n")
+print(er_comp)
+```

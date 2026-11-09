@@ -1,0 +1,17 @@
+q_lin,q_col,n_mun,n_trat,n_ctrl,att,se,p_valor,sucesso,motivo
+1,1,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+1,2,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+1,3,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+1,4,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+2,1,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+2,2,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+2,3,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+2,4,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+3,1,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+3,2,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+3,3,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+3,4,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+4,1,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+4,2,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+4,3,NA,NA,NA,NA,NA,NA,FALSE,erro_externo
+4,4,NA,NA,NA,NA,NA,NA,FALSE,erro_externo

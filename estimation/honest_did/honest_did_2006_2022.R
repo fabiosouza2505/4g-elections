@@ -1,0 +1,184 @@
+# ============================================================================
+# HONEST-DID (Rambachan & Roth, 2023) — robustez a violações de tendências
+# paralelas, sobre o painel consolidado 2006–2022.
+#
+# Motivação: o event study revelou pré-tendências significativas (coortes 2014
+# e 2018 já subindo antes do 4G). O Honest-DiD não "conserta" isso — ele reporta
+# até que MAGNITUDE de violação das tendências paralelas o efeito estimado
+# permanece distinguível de zero.
+#
+# Roda para DV = esteban_ray_corr e wolfson, na especificação 3b.
+# Saídas: subpasta honest_did/  (CSV dos intervalos + PNG dos plots).
+# ============================================================================
+
+# ── Pacotes ─────────────────────────────────────────────────────────────────
+# HonestDiD não está no CRAN: instalar do GitHub uma vez.
+#   install.packages("remotes")
+#   remotes::install_github("asheshrambachan/HonestDiD")
+library(tidyverse)
+library(did)
+library(HonestDiD)
+
+dir_out <- "honest_did"
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================================
+# Passo 1: Dados + índice de tempo CONSECUTIVO (essencial para o HonestDiD)
+# ============================================================================
+# As eleições são de 4 em 4 anos (2006, 2010, 2014, 2018, 2022). O HonestDiD
+# assume períodos consecutivos com referência em e = -1. Reindexamos:
+#   2006->1, 2010->2, 2014->3, 2018->4, 2022->5
+# Assim os tempos-de-evento viram inteiros {-4,...,+4} e e = -1 existe.
+# ----------------------------------------------------------------------------
+dados <- read_csv("../../data/processed/painel_consolidado_2006_2022.csv",
+                  col_types = cols(codigo_tse = col_character()))
+
+mapa_periodo <- c("2006" = 1L, "2010" = 2L, "2014" = 3L,
+                  "2018" = 4L, "2022" = 5L)
+
+dados <- dados %>%
+  mutate(periodo = mapa_periodo[as.character(ano)])
+
+# ID numérico
+dados <- dados %>%
+  left_join(dados %>% distinct(codigo_tse) %>% arrange(codigo_tse) %>%
+              mutate(id = row_number()),
+            by = "codigo_tse")
+
+# gname em ÍNDICE de período (1º período com 4G); 0 = never-treated
+dados <- dados %>%
+  group_by(id) %>% arrange(id, periodo) %>%
+  mutate(
+    g_per = ifelse(any(tem_4g == 1), min(periodo[tem_4g == 1]), 0L),
+    gname = as.integer(g_per)
+  ) %>% ungroup()
+
+cat("Distribuição de coortes (índice de período):\n")
+print(dados %>% distinct(id, gname) %>% count(gname) %>% arrange(gname))
+
+# ============================================================================
+# Passo 2: Helper honest_did para objetos aggte (dynamic) do pacote did
+# (adaptado de Rambachan & Roth / Sant'Anna — integração HonestDiD × did)
+# ============================================================================
+honest_did <- function(es, ...) UseMethod("honest_did", es)
+
+honest_did.AGGTEobj <- function(es,
+                                type = c("relative_magnitude", "smoothness"),
+                                gridPoints = 100,
+                                ...) {
+  type <- match.arg(type)
+  if (es$type != "dynamic") stop("Passe um event study: aggte(type = 'dynamic').")
+
+  # Função-influência dos efeitos dinâmicos -> matriz de var-cov
+  es_inf_func <- es$inf.function$dynamic.inf.func.e
+  n <- nrow(es_inf_func)
+  V <- t(es_inf_func) %*% es_inf_func / n / n
+
+  # Remover o período de referência (e = -1, normalizado a zero)
+  ref <- which(es$egt == -1)
+  if (length(ref) == 0)
+    stop("Não há e = -1 no event study. Verifique o índice de período consecutivo.")
+  V    <- V[-ref, -ref]
+  beta <- es$att.egt[-ref]
+
+  nperiods <- nrow(V)
+  npre     <- sum(es$egt < -1)
+  npost    <- nperiods - npre
+  cat(sprintf("  npre = %d | npost = %d\n", npre, npost))
+
+  # l_vec: efeito médio pós-tratamento (média dos horizontes pós)
+  l_vec <- rep(1 / npost, npost)
+
+  orig_ci <- constructOriginalCS(betahat = beta, sigma = V,
+                                 numPrePeriods = npre, numPostPeriods = npost,
+                                 l_vec = l_vec)
+
+  robust_ci <- if (type == "relative_magnitude") {
+    createSensitivityResults_relativeMagnitudes(
+      betahat = beta, sigma = V,
+      numPrePeriods = npre, numPostPeriods = npost,
+      l_vec = l_vec, gridPoints = gridPoints, ...)
+  } else {
+    createSensitivityResults(
+      betahat = beta, sigma = V,
+      numPrePeriods = npre, numPostPeriods = npost,
+      l_vec = l_vec, ...)
+  }
+
+  list(robust_ci = robust_ci, orig_ci = orig_ci, type = type)
+}
+
+# ============================================================================
+# Passo 3: Rotina por DV — att_gt(3b) -> aggte dynamic -> HonestDiD
+# ============================================================================
+xformla_3b <- ~ bl_densidade_2010_win + anos_3g + erbs_per_km2 + log_pib_pc + prop_medio_mais
+
+rodar_honestdid <- function(yname) {
+  cat(sprintf("\n%s\nHONEST-DID — DV = %s\n%s\n", strrep("=", 70), yname, strrep("=", 70)))
+
+  cs <- att_gt(
+    yname = yname, tname = "periodo", idname = "id", gname = "gname",
+    xformla = xformla_3b, data = dados,
+    control_group = "notyettreated", est_method = "reg",
+    base_period = "universal", anticipation = 0, print_details = FALSE
+  )
+  es <- aggte(cs, type = "dynamic")
+  cat(sprintf("ATT dinâmico (médio): %+.5f (SE %.5f)\n",
+              es$overall.att, es$overall.se))
+
+  # ── (a) Relative magnitudes: M̄ = quão maior a violação pós pode ser vs a
+  #        maior violação PRÉ observada. M̄ = 0 -> tendências paralelas exatas.
+  Mbar_grid <- seq(0, 2, by = 0.5)
+  rm <- honest_did.AGGTEobj(es, type = "relative_magnitude",
+                            Mbarvec = Mbar_grid)
+
+  # ── (b) Smoothness: M = quanto a tendência pode se desviar de linear entre
+  #        períodos consecutivos. M = 0 -> extrapolação linear da pré-tendência.
+  M_grid <- seq(0, 0.02, by = 0.005)   # ajustar à escala da DV
+  sm <- honest_did.AGGTEobj(es, type = "smoothness", Mvec = M_grid)
+
+  # ── Salvar tabelas ────────────────────────────────────────────────────────
+  readr::write_csv(rm$robust_ci, file.path(dir_out, sprintf("honestdid_relmag_%s.csv", yname)))
+  readr::write_csv(sm$robust_ci, file.path(dir_out, sprintf("honestdid_smooth_%s.csv", yname)))
+  readr::write_csv(rm$orig_ci,   file.path(dir_out, sprintf("honestdid_origci_%s.csv", yname)))
+
+  # ── Plots ─────────────────────────────────────────────────────────────────
+  p_rm <- createSensitivityPlot_relativeMagnitudes(rm$robust_ci, rm$orig_ci) +
+    ggplot2::labs(title = sprintf("Honest-DiD (relative magnitudes) — %s", yname),
+                  subtitle = "M̄ = magnitude da violação pós / máx. violação pré. Robusto se o IC exclui 0.")
+  ggplot2::ggsave(file.path(dir_out, sprintf("honestdid_relmag_%s.png", yname)),
+                  p_rm, width = 9, height = 6, dpi = 300, bg = "white")
+
+  p_sm <- createSensitivityPlot(sm$robust_ci, sm$orig_ci) +
+    ggplot2::labs(title = sprintf("Honest-DiD (smoothness) — %s", yname))
+  ggplot2::ggsave(file.path(dir_out, sprintf("honestdid_smooth_%s.png", yname)),
+                  p_sm, width = 9, height = 6, dpi = 300, bg = "white")
+
+  cat("  ➜ 'breakdown' M̄: o menor M̄ em que o IC robusto passa a incluir 0.\n")
+  print(rm$robust_ci)
+
+  invisible(list(rm = rm, sm = sm, es = es))
+}
+
+# ============================================================================
+# Passo 4: Executar para as duas DV
+# ============================================================================
+res_er  <- rodar_honestdid("esteban_ray_corr")
+res_wf  <- rodar_honestdid("wolfson")
+
+cat(sprintf("\n✅ Honest-DiD concluído. Arquivos em '%s'.\n", normalizePath(dir_out)))
+
+# ============================================================================
+# COMO LER
+# ============================================================================
+# • O IC "Original" é o de Callaway-Sant'Anna (assume tendências paralelas exatas).
+# • Cada linha do resultado robusto dá o IC do ATT médio pós sob uma violação de
+#   magnitude M̄ (ou M). O "BREAKDOWN VALUE" é o maior M̄ para o qual o IC ainda
+#   EXCLUI zero: quanto maior, mais robusto o efeito.
+# • Interpretação típica: "o efeito positivo do 4G sobre a bipolarização (Wolfson)
+#   permanece significativo mesmo permitindo violações pós até M̄ vezes a maior
+#   violação pré observada." Se o breakdown for < 1, o efeito NÃO sobrevive nem a
+#   uma violação do tamanho da própria pré-tendência — sinal de fragilidade.
+# • O grid de M (smoothness) deve ser calibrado à escala da DV: Wolfson (~0–0.6)
+#   comporta M maior que o ER_corr (~0–0.15). Ajuste M_grid conforme necessário.
+# ============================================================================

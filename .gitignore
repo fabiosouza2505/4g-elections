@@ -1,0 +1,22 @@
+# Large raw files (download from TSE/ANATEL — see README)
+votacao_candidato_munzona_*.csv
+Estacoes_SMP.csv
+Densidade_Banda_Larga_Fixa.csv
+# R / RStudio
+.Rhistory
+.RData
+.RDataTmp*
+.Rproj.user/
+*_files/
+*.html
+# Python / editors
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+# LaTeX build
+*.aux
+*.log
+*.synctex.gz
+*.out
+*.toc
